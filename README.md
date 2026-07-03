@@ -8,7 +8,7 @@ Accepts a `.apk`, `.apkm`, or `.xapk`. Split bundles are merged into a single AP
 
 ## How it works
 
-The login check lives in the Netflix Games SDK, not the game. Every Netflix title bundles the same SDK in `classes.dex` and calls into it over JNI, so one set of smali patches works regardless of engine (Unity, native, etc.).
+The login check lives in the Netflix Games SDK, not the game. Every Netflix title bundles the same SDK in `classes.dex` and calls into it over JNI, so one set of smali patches works regardless of engine (Unity, GameMaker, Unreal, native).
 
 The tool decodes the base APK with apktool and rewrites five SDK methods:
 
@@ -22,12 +22,18 @@ Netflix shipped three generations of this SDK, and the tool detects which one it
 - **Older (2024)** titles have no `doRequestPlayerAccess` and instead gate on an access UI that has to be dismissed before boot continues. For those, the tool no-ops the error screen, returns a synthetic offline profile from `getCurrentProfile`, and fires the access-granted and access-UI-dismissed events once so the boot handshake completes. Some class names in that path are obfuscated, so it discovers them by their SDK supertypes rather than by name.
 - **Oldest (2022-2023)** titles use the original `com.netflix.android.api` SDK, with none of the above. Auth is a `checkUserAuth` call whose result comes back as an `onUserStateChange` event, and identity is a `getCurrentPlayer` call. The tool returns a dummy player, fires a synthetic signed-in state, and forces every user-state event to read as authenticated. These titles also store progress *only* in the Netflix cloud-save slots (no local save), so the tool additionally replaces the dead slot API with a real local file store keyed to a stable offline identity, so saves persist across launches.
 
-These SDKs also appear in **non-Unity** games. Unity titles reach the SDK through a `com.netflix.unity` bridge; **GameMaker** titles (engine `libyoyo.so`) instead have a game-authored GameMaker extension class that exposes `Nfxa*` methods that GML calls, with results returned to GML as async events. When there is no Unity bridge, the tool detects the GameMaker case, finds that glue class, and patches it. It handles both SDK generations seen in GameMaker titles:
+These SDKs also appear in **non-Unity** games, which reach the SDK through a game-authored glue class instead of the `com.netflix.unity` bridge. When there is no Unity bridge, the tool detects the engine and finds that glue class by parsing.
+
+**GameMaker** titles (engine `libyoyo.so`) have a GameMaker extension class that exposes `Nfxa*` methods that GML calls, with results returned to GML as async events. The tool handles both SDK generations seen in GameMaker titles:
 
 - **oldest SDK (`com.netflix.android.api`):** delivers a synthetic authenticated state to the glue's event receiver (so the game's own handler reports "signed in"), and redirects the cloud-save *slot* methods to a local file store, reusing the game's own result callbacks (a slot miss reports "unknown slot" so the game starts fresh instead of parsing empty save data).
 - **newer SDK (`com.netflix.games`):** synthesizes a granted player access and calls the access callback locally, returns a synthetic offline profile from `getCurrentProfile`, and redirects the cloud-save *blob* methods to a local file store (a blob miss reports "blob not found" — not an empty success, which the game would try to decode).
 
-Either way, GameMaker's engine is ARM-only, so the tool also drops the engine-less `x86`/`x86_64` libraries (the `lib` folders in a single APK, or the `x86`/`x86_64` architecture splits in a split bundle), which lets x86 emulators run the app under ARM translation instead of failing to find the engine.
+GameMaker's engine is ARM-only, so for those the tool also drops the engine-less `x86`/`x86_64` libraries (the `lib` folders in a single APK, or the `x86`/`x86_64` architecture splits in a split bundle), which lets x86 emulators run the app under ARM translation instead of failing to find the engine.
+
+**Unreal Engine** titles (engine `libUE4.so`, e.g. *CoComelon: Play with JJ*) bridge to native C++ through a glue class built on Unreal's JNI convention: `Thunk_*` methods the native side calls in, and `native nativeOn*` methods that call back into native. Their SDK is the oldest generation (`com.netflix.android.api`): `Thunk_checkNetflixUserAuth` kicks off the handshake and the result returns via a `nativeOnNetflixUserStateChanged(nativeObj, previous, current, playerIdentity)` callback (a non-null current profile means signed in). The tool finds the glue and its two inner classes (the `checkUserAuth` runnable and the SDK event handler) by parsing, then rewrites both to deliver a synthetic signed-in profile straight to that native callback with no network. These titles keep their progress in the engine's own on-device save rather than the Netflix cloud, so auth is the only wall — no cloud-save store is needed.
+
+> **Note (GameMaker and Unreal):** the tool decodes with resources kept raw, so it can't edit the binary manifest. If a Netflix game declares the `com.netflix.nfgsdk.permission.ngpstore` permission, installing it alongside *another* patched Netflix game fails with `INSTALL_FAILED_DUPLICATE_PERMISSION`. Removing that one `<permission>` declaration (a full `apktool d` on the output, then rebuild) is a per-game step; standalone installs are unaffected.
 
 It then rebuilds the APK, merges any config splits with APKEditor, zipaligns, and signs with your keystore. It aborts if the SDK layout has drifted enough that a critical method can't be found.
 
