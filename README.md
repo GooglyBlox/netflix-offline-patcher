@@ -16,7 +16,11 @@ The tool decodes the base APK with apktool and rewrites five SDK methods:
 - `startSdkErrorActivity` becomes a no-op, so the "Something went wrong" screen never opens.
 - `readBlob`, `getBlobs`, and `writeBlob` return an offline "no cloud save" result instead of hanging on the dead server.
 
-Netflix shipped two generations of this SDK, and the tool detects which one it is facing. Newer titles (2025) use the request-and-grant model above. Older titles (2024) have no `doRequestPlayerAccess` and instead gate on an access UI that has to be dismissed before boot continues. For those, the tool no-ops the error screen, returns a synthetic offline profile from `getCurrentProfile`, and fires the access-granted and access-UI-dismissed events once so the boot handshake completes. Some class names in that path are obfuscated, so it discovers them by their SDK supertypes rather than by name.
+Netflix shipped three generations of this SDK, and the tool detects which one it is facing.
+
+- **Newer (2025)** titles use the request-and-grant model above (`doRequestPlayerAccess`).
+- **Older (2024)** titles have no `doRequestPlayerAccess` and instead gate on an access UI that has to be dismissed before boot continues. For those, the tool no-ops the error screen, returns a synthetic offline profile from `getCurrentProfile`, and fires the access-granted and access-UI-dismissed events once so the boot handshake completes. Some class names in that path are obfuscated, so it discovers them by their SDK supertypes rather than by name.
+- **Oldest (2022-2023)** titles use the original `com.netflix.android.api` SDK, with none of the above. Auth is a `checkUserAuth` call whose result comes back as an `onUserStateChange` event, and identity is a `getCurrentPlayer` call. The tool returns a dummy player, fires a synthetic signed-in state, and forces every user-state event to read as authenticated. These titles also store progress *only* in the Netflix cloud-save slots (no local save), so the tool additionally replaces the dead slot API with a real local file store keyed to a stable offline identity, so saves persist across launches.
 
 It then rebuilds the APK, merges any config splits with APKEditor, zipaligns, and signs with your keystore. It aborts if the SDK layout has drifted enough that a critical method can't be found.
 
