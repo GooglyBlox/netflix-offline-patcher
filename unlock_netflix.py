@@ -879,6 +879,182 @@ def strip_non_arm_libs(dec):
                 print(f"      stripped lib/{a} (arm-only engine -> ARM translation on x86 emulators)")
 
 
+# -----------------------------------------------------------------------------
+# GameMaker + the NEWER com.netflix.games SDK (gen-2, same as the 2025 request/grant Unity titles).
+#
+# A later GameMaker title (e.g. Sports Sports) uses the gen-2 com.netflix.games SDK, not the gen-0
+# com.netflix.android.api one above. No Unity bridge, and the glue exposes NfxaShowUI() (not
+# NfxaCheckUserAuth). These are exactly the gen-2 walls (access grant + a synthetic profile + a blob
+# cloud-save), applied at the GameMaker glue:
+#   - access: NfxaShowUI() -> AccessApi.requestPlayerAccess(cb). Rewrite it to synthesize a granted
+#     PlayerAccessInfo("offline-player") and call that callback locally.
+#   - profile: rewrite ProfilesApiImpl.getCurrentProfile() to a synthetic OfflineCurrentProfile.
+#   - saves: NfxaCloudRead/Write -> BlobStoreApi.readPlayerBlob/writePlayerBlob. Redirect to a local
+#     file store and invoke the game's own callbacks. A read MISS must return an error with
+#     BLOB_NAME_NOT_FOUND (not status-0/empty, which the game decodes -> crash; not a null container,
+#     which NPEs ReadPlayerBlobResult's ctor -> the read times out).
+# -----------------------------------------------------------------------------
+_GM2_PROF = "com/netflix/games/player/profiles"
+_GM2_READRES = "Lcom/netflix/games/storage/blobs/ReadPlayerBlobResult;"
+_GM2_WRITERES = "Lcom/netflix/games/storage/blobs/WritePlayerBlobResult;"
+_GM2_BLOBC = "Lcom/netflix/games/storage/blobs/BlobContainer;"
+_GM2_CONF = "Lcom/netflix/games/storage/blobs/Conflict;"
+_GM2_NOTFOUND = "Lcom/netflix/games/errors/ErrorCodes$BlobStore;->BLOB_NAME_NOT_FOUND:I"
+
+_GM2_OFFLINE_PROFILE = """.class public final Lcom/netflix/games/player/profiles/OfflineCurrentProfile;
+.super Lcom/netflix/games/player/profiles/CurrentProfile;
+.source "OfflineCurrentProfile.java"
+
+# %MARK% offline profile (CurrentProfile is abstract)
+
+.method public constructor <init>()V
+    .locals 3
+    const-string v0, "offline-player"
+    const-string v1, "Offline"
+    const-string v2, "en"
+    invoke-direct {p0, v0, v1, v2}, Lcom/netflix/games/player/profiles/CurrentProfile;-><init>(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V
+    return-void
+.end method
+
+.method public getLegacyGamerAccessToken()Lcom/netflix/games/NetflixResult;
+    .locals 2
+    sget-object v0, Lcom/netflix/games/NetflixResult;->Companion:Lcom/netflix/games/NetflixResult$Companion;
+    const-string v1, "offline-player"
+    invoke-virtual {v0, v1}, Lcom/netflix/games/NetflixResult$Companion;->withData(Ljava/lang/Object;)Lcom/netflix/games/NetflixResult;
+    move-result-object v0
+    return-object v0
+.end method
+
+.method public getLegacyGamerProfileId()Lcom/netflix/games/NetflixResult;
+    .locals 2
+    sget-object v0, Lcom/netflix/games/NetflixResult;->Companion:Lcom/netflix/games/NetflixResult$Companion;
+    const-string v1, "offline-player"
+    invoke-virtual {v0, v1}, Lcom/netflix/games/NetflixResult$Companion;->withData(Ljava/lang/Object;)Lcom/netflix/games/NetflixResult;
+    move-result-object v0
+    return-object v0
+.end method
+""".replace("%MARK%", MARKER)
+
+_GM2_GETCURRENTPROFILE = """.method public getCurrentProfile()Lcom/netflix/games/NetflixResult;
+    .locals 3
+    .annotation system Ldalvik/annotation/Signature;
+        value = {
+            "()",
+            "Lcom/netflix/games/NetflixResult<",
+            "Lcom/netflix/games/player/profiles/CurrentProfile;",
+            ">;"
+        }
+    .end annotation
+
+    # %MARK% offline profile
+    new-instance v0, Lcom/netflix/games/player/profiles/OfflineCurrentProfile;
+    invoke-direct {v0}, Lcom/netflix/games/player/profiles/OfflineCurrentProfile;-><init>()V
+    new-instance v1, Lcom/netflix/games/NetflixResult;
+    const/4 v2, 0x0
+    invoke-direct {v1, v0, v2}, Lcom/netflix/games/NetflixResult;-><init>(Ljava/lang/Object;Lcom/netflix/games/Error;)V
+    return-object v1
+.end method""".replace("%MARK%", MARKER)
+
+
+def _gm2_find_glue(dec):
+    """gen-2 GameMaker glue: exposes NfxaShowUI + NfxaCloudRead (and NOT the gen-0 NfxaCheckUserAuth)."""
+    for d in sorted(dec.glob("smali*")):
+        for f in d.rglob("*.smali"):
+            try:
+                t = f.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if "NfxaShowUI(" in t and "NfxaCloudRead(" in t and "NfxaCheckUserAuth(" not in t:
+                return f
+    return None
+
+
+def is_gamemaker_gen2_sdk(dec):
+    return (find_smali_file(dec, "com/yoyogames/runner/RunnerJNILib") is not None
+            and find_smali_file(dec, f"{_GM2_PROF}/ProfilesApiImpl") is not None
+            and find_smali_file(dec, "com/netflix/games/storage/blobs/BlobStoreApi") is not None
+            and _gm2_find_glue(dec) is not None)
+
+
+def patch_gamemaker_gen2(dec, report):
+    def note(status, name):
+        report[status].append(name)
+
+    glue_f = _gm2_find_glue(dec)
+    smdir = next(d for d in dec.glob("smali*") if glue_f.is_relative_to(d))
+    glue = "L" + str(glue_f.relative_to(smdir).with_suffix("")).replace("\\", "/") + ";"
+    store = f"L{glue[1:-1].rsplit('/', 1)[0]}/NfxBlobStore;"
+    t = glue_f.read_text(encoding="utf-8")
+
+    def orig(sig):
+        s = t[t.index(".method public " + sig):]
+        return s[:s.index(".end method")]
+
+    # error screen
+    ef = find_smali_file(dec, "com/netflix/mediaclient/ui/errors/SdkErrorActivity$Companion")
+    if ef is not None:
+        new, st = patch_method(ef.read_text(encoding="utf-8"), "startSdkErrorActivity(", 0, ["return-void"])
+        if st == "patched":
+            ef.write_text(new, encoding="utf-8")
+        note(st, "suppress-error-screen")
+
+    # profile -> synthetic offline CurrentProfile
+    impl = find_smali_file(dec, f"{_GM2_PROF}/ProfilesApiImpl")
+    (impl.parent / "OfflineCurrentProfile.smali").write_text(_GM2_OFFLINE_PROFILE, encoding="utf-8")
+    itxt, _ = _gm_replace_method(impl.read_text(encoding="utf-8"), "getCurrentProfile()", _GM2_GETCURRENTPROFILE)
+    impl.write_text(itxt, encoding="utf-8")
+    note("patched", "offline-profile")
+
+    # access grant: NfxaShowUI -> synthesize a granted result, call the requestPlayerAccess callback
+    cb2, _ = _gm_callback(orig("NfxaShowUI()"))
+    show = [
+        f"new-instance v0, {_PAI}", 'const-string v1, "offline-player"',
+        f"invoke-direct {{v0, v1}}, {_PAI}-><init>(Ljava/lang/String;)V",
+        f"new-instance v1, {_RES}", "const/4 v2, 0x0",
+        f"invoke-direct {{v1, v0, v2}}, {_RES}-><init>(Ljava/lang/Object;{_ERR})V",
+        f"new-instance v0, {cb2}", f"invoke-direct {{v0, p0}}, {cb2}-><init>({glue})V",
+        f"invoke-virtual {{v0, v1}}, {cb2}->onResult({_RES})V", "return-void"]
+    t = _gm_replace_method(t, "NfxaShowUI()", _full_method(".method public NfxaShowUI()V", 3, show))[0]
+
+    # blob cloud-save: local store + synthesized result -> the game's own callbacks
+    cbr, _ = _gm_callback(orig("NfxaCloudRead("))
+    read = [
+        f"invoke-static {{p1}}, {store}->read(Ljava/lang/String;)Ljava/lang/String;", "move-result-object v0",
+        "if-eqz v0, :nfx_miss", "invoke-virtual {v0}, Ljava/lang/String;->getBytes()[B", "move-result-object v0",
+        f"new-instance v1, {_GM2_BLOBC}", f"invoke-direct {{v1, v0}}, {_GM2_BLOBC}-><init>([B)V",
+        "const/4 v2, 0x0", f"new-instance v3, {_GM2_READRES}",
+        f"invoke-direct {{v3, v1, v2}}, {_GM2_READRES}-><init>({_GM2_BLOBC}{_GM2_CONF})V",
+        f"new-instance v0, {_RES}", f"invoke-direct {{v0, v3, v2}}, {_RES}-><init>(Ljava/lang/Object;{_ERR})V",
+        "goto :nfx_deliver", ":nfx_miss",
+        f"new-instance v1, {_ERR}", f"sget v2, {_GM2_NOTFOUND}", 'const-string v3, "not found"',
+        f"invoke-direct {{v1, v2, v3}}, {_ERR}-><init>(ILjava/lang/String;)V",
+        f"new-instance v0, {_RES}", "const/4 v2, 0x0",
+        f"invoke-direct {{v0, v2, v1}}, {_RES}-><init>(Ljava/lang/Object;{_ERR})V", ":nfx_deliver",
+        f"new-instance v1, {cbr}", f"invoke-direct {{v1, p0, p1}}, {cbr}-><init>({glue}Ljava/lang/String;)V",
+        f"invoke-virtual {{v1, v0}}, {cbr}->onResult({_RES})V",
+        "const-wide/high16 v0, 0x3ff0000000000000L", "return-wide v0"]
+    t = _gm_replace_method(t, "NfxaCloudRead(", _full_method(".method public NfxaCloudRead(Ljava/lang/String;)D", 5, read))[0]
+
+    cbw, _ = _gm_callback(orig("NfxaCloudWrite("))
+    write = [
+        f"invoke-static {{p1, p2}}, {store}->write(Ljava/lang/String;Ljava/lang/String;)V",
+        f"new-instance v0, {_GM2_WRITERES}", "const/4 v1, 0x0",
+        f"invoke-direct {{v0, v1}}, {_GM2_WRITERES}-><init>({_GM2_CONF})V",
+        f"new-instance v2, {_RES}", f"invoke-direct {{v2, v0, v1}}, {_RES}-><init>(Ljava/lang/Object;{_ERR})V",
+        f"new-instance v3, {cbw}", f"invoke-direct {{v3, p0, p1}}, {cbw}-><init>({glue}Ljava/lang/String;)V",
+        f"invoke-virtual {{v3, v2}}, {cbw}->onResult({_RES})V",
+        "const-wide/high16 v0, 0x3ff0000000000000L", "return-wide v0"]
+    t = _gm_replace_method(t, "NfxaCloudWrite(", _full_method(".method public NfxaCloudWrite(Ljava/lang/String;Ljava/lang/String;)D", 4, write))[0]
+
+    glue_f.write_text(t, encoding="utf-8")
+    note("patched", "grant-offline-auth")
+    note("patched", "local-blob-store")
+
+    (glue_f.parent / "NfxBlobStore.smali").write_text(
+        _g0_slot_store_smali(None).replace("com/netflix/unity/impl/NfxSlotStore", store[1:-1]),
+        encoding="utf-8")
+
+
 def resolve_tools(args):
     cfg = {}
     local = HERE / "config.local.json"
@@ -977,13 +1153,19 @@ def main():
         dec = work / "apktool_base"
         run([T["java"], "-jar", T["apktool"], "d", "-r", "-f", "-o", str(dec), str(base_apk)], env=env)
         has_unity_bridge = find_smali_file(dec, SDK_MARKER_CLASS) is not None
-        gamemaker = (not has_unity_bridge) and is_gamemaker_sdk(dec)
+        gamemaker_gen0 = (not has_unity_bridge) and is_gamemaker_sdk(dec)
+        gamemaker_gen2 = (not has_unity_bridge) and (not gamemaker_gen0) and is_gamemaker_gen2_sdk(dec)
+        gamemaker = gamemaker_gen0 or gamemaker_gen2
         if not has_unity_bridge and not gamemaker:
             sys.exit("! no NfUnitySdkInternal found. this doesn't look like a Netflix game.")
 
         print("[3/5] patching Netflix Games SDK")
         report = {"patched": [], "already": [], "not_found": [], "skipped": []}
-        if gamemaker:
+        if gamemaker_gen2:
+            print("      GameMaker + newer com.netflix.games SDK (no Unity bridge; patching the GameMaker glue)")
+            patch_gamemaker_gen2(dec, report)
+            strip_non_arm_libs(dec)
+        elif gamemaker_gen0:
             print("      GameMaker + oldest SDK (no Unity bridge; patching the GameMaker glue class)")
             patch_gamemaker(dec, report)
             strip_non_arm_libs(dec)
@@ -1024,6 +1206,12 @@ def main():
             merge_in = work / "merge_in"; merge_in.mkdir()
             shutil.copy(base_out, merge_in / "base.apk")
             for s in splits:
+                # GameMaker's engine (libyoyo) is arm-only, so drop the x86/x86_64 arch config
+                # splits (which carry no engine) - the merged arm-only APK then runs under ARM
+                # translation on x86 emulators instead of failing to find the engine.
+                if gamemaker and re.search(r"config\.x86(_64)?\.apk$", s.name):
+                    print(f"      (skip {s.name}: arm-only engine)")
+                    continue
                 shutil.copy(s, merge_in / s.name)
             to_sign = work / "merged.apk"
             run([T["java"], "-jar", T["apkeditor"], "m", "-i", str(merge_in), "-o", str(to_sign), "-f"], env=env)
