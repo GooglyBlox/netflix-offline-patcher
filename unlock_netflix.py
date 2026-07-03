@@ -682,6 +682,203 @@ def patch_gen0(dec, report):
     note(st, "force-authenticated-event")
 
 
+# -----------------------------------------------------------------------------
+# GameMaker (libyoyo) + oldest SDK, no Unity bridge.
+#
+# Some Netflix titles are GameMaker Studio games, not Unity/native. They carry the same oldest
+# SDK (com.netflix.android.api - NetflixProfile/NetflixSdkState/Locale) but have NO Unity bridge
+# (NfUnitySdkInternal), so the checks above all miss and the tool would abort. Instead, the
+# GameMaker<->Netflix glue is a single game class (a GameMaker extension) that implements
+# NetflixSdkEventHandler and exposes Nfxa* methods GML calls; results go back to GML as RunnerJNILib
+# async events. We patch that glue (never the DexGuard-flattened NetflixGameSdk):
+#   - auth: deliver a synthetic authenticated NetflixSdkState to the glue's event receiver, so its
+#     own onUserStateChange fires the game's "signed in" async event. No network, no hardcoded keys.
+#   - saves: the game's only progress store is the Netflix cloud-save SLOT api (raw
+#     com.netflix.android.api.cloudsave types, not the unity wrapper). Redirect the four Nfxa cloud
+#     methods to a local file store (NfxSlotStore) and invoke the game's OWN result callbacks with a
+#     synthesized OK result. A read MISS must return ERROR_UNKNOWN_SLOT_ID (not OK+empty), or the game
+#     tries to parse empty savedata and errors.
+# -----------------------------------------------------------------------------
+_GM_EVH = "Lcom/netflix/android/api/events/NetflixSdkEventHandler;"
+_GM_SLOTINFO = "Lcom/netflix/android/api/cloudsave/SlotInfo;"
+_GM_READRES = "Lcom/netflix/android/api/cloudsave/CloudSave$ReadSlotResult;"
+_GM_SAVERES = "Lcom/netflix/android/api/cloudsave/CloudSave$SaveSlotResult;"
+_GM_IDSRES = "Lcom/netflix/android/api/cloudsave/CloudSave$GetSlotIdsResult;"
+_GM_DELRES = "Lcom/netflix/android/api/cloudsave/CloudSave$DeleteSlotResult;"
+_ONE_D = "0x3ff0000000000000L"  # double 1.0, the Nfxa* success-request return
+
+
+def _gm_find_glue(dec):
+    """The GameMaker<->Netflix glue class file (has the Nfxa* extension methods GML calls)."""
+    for d in sorted(dec.glob("smali*")):
+        for f in d.rglob("*.smali"):
+            try:
+                t = f.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if "NfxaCheckUserAuth(" in t and "NfxaCloudRead(" in t:
+                return f
+    return None
+
+
+def is_gamemaker_sdk(dec):
+    """GameMaker (RunnerJNILib) game on the oldest SDK with no Unity bridge - the glue is a game
+    class exposing Nfxa* methods and implementing NetflixSdkEventHandler."""
+    return (find_smali_file(dec, "com/yoyogames/runner/RunnerJNILib") is not None
+            and find_smali_file(dec, "com/netflix/android/api/netflixsdk/NetflixSdk") is not None
+            and find_smali_file(dec, "com/netflix/android/api/cloudsave/CloudSave") is not None
+            and _gm_find_glue(dec) is not None)
+
+
+def _full_method(header, locals_, body):
+    return "\n".join([header, f"    .locals {locals_}", f"    # {MARKER}"]
+                     + ["    " + b if b else "" for b in body] + [".end method"])
+
+
+def _gm_replace_method(text, sig, new_method):
+    lines = text.split("\n")
+    start = next((i for i, ln in enumerate(lines)
+                  if ln.strip().startswith(".method") and sig in ln), None)
+    if start is None:
+        return text, "not_found"
+    end = next(j for j in range(start + 1, len(lines)) if lines[j].strip() == ".end method")
+    return "\n".join(lines[:start] + new_method.split("\n") + lines[end + 1:]), "patched"
+
+
+def _gm_callback(method_text):
+    """(callback_class_desc, takes_slot) for the inner-class result callback a cloud method builds."""
+    ni = re.findall(r"new-instance [vp]\d+, (L[\w/$]+\$\d+;)", method_text)
+    if not ni:
+        return None, False
+    cb = ni[-1]
+    m = re.search(re.escape(cb) + r"-><init>\(([^)]*)\)V", method_text)
+    return cb, ("Ljava/lang/String;" in (m.group(1) if m else ""))
+
+
+def _gm_cb_new(cb, glue, takes_slot):
+    ctor = f"{glue}Ljava/lang/String;" if takes_slot else glue
+    args = "{v5, p0, p1}" if takes_slot else "{v5, p0}"
+    return [f"new-instance v5, {cb}", f"invoke-direct {args}, {cb}-><init>({ctor})V"]
+
+
+def patch_gamemaker(dec, report):
+    """Patch a GameMaker Netflix game's glue class: offline auth + a local cloud-save slot store."""
+    def note(status, name):
+        report[status].append(name)
+
+    glue_f = _gm_find_glue(dec)
+    smdir = next(d for d in dec.glob("smali*") if glue_f.is_relative_to(d))
+    glue = "L" + str(glue_f.relative_to(smdir).with_suffix("")).replace("\\", "/") + ";"
+    glue_pkg = glue[1:-1].rsplit("/", 1)[0]
+    store = f"L{glue_pkg}/NfxSlotStore;"
+    t = glue_f.read_text(encoding="utf-8")
+
+    # event-receiver field on the glue (type NetflixSdkEventHandler)
+    m = re.search(r"\.field[^\n]*?\b(\w+):" + re.escape(_GM_EVH), t)
+    if m is None:
+        sys.exit("! GameMaker glue has no NetflixSdkEventHandler field (layout changed?)")
+    evfield = f"->{m.group(1)}:{_GM_EVH}"
+
+    # 1. auth: deliver a synthetic authenticated state to the glue's own event receiver
+    auth = _g0_authed_state() + [
+        f"iget-object v0, p0, {glue}{evfield}",
+        f"invoke-interface {{v0, v1}}, {_GM_EVH}->onUserStateChange({_G0_STATE})V",
+        "return-void"]
+    t, st = _gm_replace_method(t, "NfxaCheckUserAuth()",
+                               _full_method(".method public NfxaCheckUserAuth()V", 8, auth))
+    note(st, "grant-offline-auth")
+
+    # 2. cloud slot methods -> local store + synthesized OK result -> the game's own callbacks
+    def cloud(sig, kind):
+        nonlocal t
+        orig = t[t.index(".method public " + sig):]
+        orig = orig[:orig.index(".end method")]
+        cb, takes = _gm_callback(orig)
+        if cb is None:
+            note("not_found", f"cloud:{kind}"); return
+        n = _gm_cb_new(cb, glue, takes)
+        if kind == "read":
+            body = [
+                f"invoke-static {{p1}}, {store}->read(Ljava/lang/String;)Ljava/lang/String;",
+                "move-result-object v0", "if-eqz v0, :nfx_miss",
+                "invoke-virtual {v0}, Ljava/lang/String;->getBytes()[B", "move-result-object v0",
+                f"new-instance v1, {_GM_SLOTINFO}", f"invoke-direct {{v1, v0}}, {_GM_SLOTINFO}-><init>([B)V",
+                f"sget-object v2, {_G0_CSS}->OK:{_G0_CSS}", "goto :nfx_build",
+                ":nfx_miss", "const/4 v0, 0x0",
+                f"new-instance v1, {_GM_SLOTINFO}", f"invoke-direct {{v1, v0}}, {_GM_SLOTINFO}-><init>([B)V",
+                f"sget-object v2, {_G0_CSS}->ERROR_UNKNOWN_SLOT_ID:{_G0_CSS}",
+                ":nfx_build", "const/4 v3, 0x0", f"new-instance v4, {_GM_READRES}",
+                f"invoke-direct {{v4, v1, v2, v3, v3}}, {_GM_READRES}-><init>({_GM_SLOTINFO}{_G0_CSS}{_G0_CONF}Ljava/lang/String;)V",
+            ] + n + [f"invoke-virtual {{v5, v4}}, {cb}->onResult({_GM_READRES})V",
+                     f"const-wide/high16 v0, {_ONE_D}", "return-wide v0"]
+            hdr = ".method public NfxaCloudRead(Ljava/lang/String;)D"
+        elif kind == "write":
+            body = [
+                f"invoke-static {{p1, p2}}, {store}->write(Ljava/lang/String;Ljava/lang/String;)V",
+                f"sget-object v2, {_G0_CSS}->OK:{_G0_CSS}", "const/4 v3, 0x0",
+                f"new-instance v4, {_GM_SAVERES}",
+                f"invoke-direct {{v4, v2, v3, v3}}, {_GM_SAVERES}-><init>({_G0_CSS}{_G0_CONF}Ljava/lang/String;)V",
+            ] + n + [f"invoke-virtual {{v5, v4}}, {cb}->onResult({_GM_SAVERES})V",
+                     f"const-wide/high16 v0, {_ONE_D}", "return-wide v0"]
+            hdr = ".method public NfxaCloudWrite(Ljava/lang/String;Ljava/lang/String;)D"
+        elif kind == "ids":
+            body = [
+                f"invoke-static {{}}, {store}->list()Ljava/util/ArrayList;", "move-result-object v0",
+                f"sget-object v2, {_G0_CSS}->OK:{_G0_CSS}", "const/4 v3, 0x0",
+                f"new-instance v4, {_GM_IDSRES}",
+                f"invoke-direct {{v4, v0, v2, v3}}, {_GM_IDSRES}-><init>(Ljava/util/List;{_G0_CSS}Ljava/lang/String;)V",
+            ] + n + [f"invoke-virtual {{v5, v4}}, {cb}->onResult({_GM_IDSRES})V",
+                     f"const-wide/high16 v0, {_ONE_D}", "return-wide v0"]
+            hdr = ".method public NfxaCloudGetSlotIDs()D"
+        else:  # delete
+            body = [
+                f"invoke-static {{p1}}, {store}->delete(Ljava/lang/String;)V",
+                f"sget-object v2, {_G0_CSS}->OK:{_G0_CSS}", "const/4 v3, 0x0",
+                f"new-instance v4, {_GM_DELRES}",
+                f"invoke-direct {{v4, v2, v3, v3}}, {_GM_DELRES}-><init>({_G0_CSS}{_G0_CONF}Ljava/lang/String;)V",
+            ] + n + [f"invoke-virtual {{v5, v4}}, {cb}->onResult({_GM_DELRES})V",
+                     f"const-wide/high16 v0, {_ONE_D}", "return-wide v0"]
+            hdr = ".method public NfxaCloudDelete(Ljava/lang/String;)D"
+        t, s = _gm_replace_method(t, sig, _full_method(hdr, 6, body))
+        note(s, f"cloud:{kind}")
+
+    cloud("NfxaCloudRead(", "read")
+    cloud("NfxaCloudWrite(", "write")
+    cloud("NfxaCloudGetSlotIDs(", "ids")
+    cloud("NfxaCloudDelete(", "delete")
+    glue_f.write_text(t, encoding="utf-8")
+
+    store_internal = f"{glue_pkg}/NfxSlotStore"
+    (glue_f.parent / "NfxSlotStore.smali").write_text(
+        _g0_slot_store_smali(None).replace("com/netflix/unity/impl/NfxSlotStore", store_internal),
+        encoding="utf-8")
+    note("patched", "local-slot-store")
+
+    # 3. suppress the error screen (belt-and-suspenders)
+    ef = find_smali_file(dec, "com/netflix/mediaclient/ui/errors/SdkErrorActivity$Companion")
+    if ef is not None:
+        new, st = patch_method(ef.read_text(encoding="utf-8"), "startSdkErrorActivity(", 0, ["return-void"])
+        if st == "patched":
+            ef.write_text(new, encoding="utf-8")
+        note(st, "suppress-error-screen")
+
+
+def strip_non_arm_libs(dec):
+    """GameMaker's engine (libyoyo.so) ships arm-only; if the x86/x86_64 lib dirs carry no engine,
+    strip them so x86 emulators run the app under ARM translation instead of failing to find it."""
+    lib = dec / "lib"
+    if not lib.is_dir():
+        return
+    has_arm = (lib / "arm64-v8a" / "libyoyo.so").exists() or (lib / "armeabi-v7a" / "libyoyo.so").exists()
+    has_x86_engine = (lib / "x86_64" / "libyoyo.so").exists() or (lib / "x86" / "libyoyo.so").exists()
+    if has_arm and not has_x86_engine:
+        for a in ("x86", "x86_64"):
+            d = lib / a
+            if d.is_dir():
+                shutil.rmtree(d)
+                print(f"      stripped lib/{a} (arm-only engine -> ARM translation on x86 emulators)")
+
+
 def resolve_tools(args):
     cfg = {}
     local = HERE / "config.local.json"
@@ -779,12 +976,18 @@ def main():
         print("[2/5] decoding base (apktool, resources kept raw)")
         dec = work / "apktool_base"
         run([T["java"], "-jar", T["apktool"], "d", "-r", "-f", "-o", str(dec), str(base_apk)], env=env)
-        if not find_smali_file(dec, SDK_MARKER_CLASS):
+        has_unity_bridge = find_smali_file(dec, SDK_MARKER_CLASS) is not None
+        gamemaker = (not has_unity_bridge) and is_gamemaker_sdk(dec)
+        if not has_unity_bridge and not gamemaker:
             sys.exit("! no NfUnitySdkInternal found. this doesn't look like a Netflix game.")
 
         print("[3/5] patching Netflix Games SDK")
         report = {"patched": [], "already": [], "not_found": [], "skipped": []}
-        if is_gen0_sdk(dec):
+        if gamemaker:
+            print("      GameMaker + oldest SDK (no Unity bridge; patching the GameMaker glue class)")
+            patch_gamemaker(dec, report)
+            strip_non_arm_libs(dec)
+        elif is_gen0_sdk(dec):
             print("      oldest SDK (com.netflix.android.api auth model; local slot store for saves)")
             patch_gen0(dec, report)
         elif is_legacy_sdk(dec):
