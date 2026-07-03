@@ -1,0 +1,13 @@
+# local machine tool paths (each user provides their own)
+config.local.json
+
+# build artifacts / inputs
+*-offline.apk
+*.apk
+*.apkm
+*.xapk
+tools/*.jar
+tools/*.zip
+nfxpatch_*/
+__pycache__/
+*.pyc
