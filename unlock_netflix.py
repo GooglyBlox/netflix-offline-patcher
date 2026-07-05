@@ -639,14 +639,20 @@ def patch_gen0(dec, report):
 
     # 5a. local slot store methods (write txt back after)
     for sig, locals_, mk in (
+        # A read MISS returns ERROR_UNKNOWN_SLOT_ID (not OK+empty): the game must be told the slot
+        # does not exist yet, or it assumes an already-present empty slot and never writes progress
+        # (verified on Pirates: Severed Seas, whose save only lands once the slot reads as "unknown").
         ("readSlot(", 4, lambda: [
             f"invoke-static {{p1}}, {_G0_STORE}->read(Ljava/lang/String;)Ljava/lang/String;",
-            "move-result-object v0", f"new-instance v1, {_G0_CSR}", f"sget-object v2, {_G0_CSS}->OK:{_G0_CSS}",
-            "const/4 v3, 0x0", f"invoke-direct {{v1, v2, v3, v3}}, {_G0_CSR_CTOR}",
-            "if-eqz v0, :nfx_miss", f"new-instance v2, {_G0_ESI}",
+            "move-result-object v0", "const/4 v3, 0x0", "if-eqz v0, :nfx_miss",
+            f"new-instance v1, {_G0_CSR}", f"sget-object v2, {_G0_CSS}->OK:{_G0_CSS}",
+            f"invoke-direct {{v1, v2, v3, v3}}, {_G0_CSR_CTOR}", f"new-instance v2, {_G0_ESI}",
             f"invoke-direct {{v2, v0}}, {_G0_ESI}-><init>(Ljava/lang/String;)V",
-            f"invoke-virtual {{v1, v2}}, {_G0_CSR}->setRemote({_G0_ESI})V",
-            ":nfx_miss", f"invoke-interface {{p2, v1}}, {_G0_CB}->onResult({_G0_CSR})V", "return-void"]),
+            f"invoke-virtual {{v1, v2}}, {_G0_CSR}->setRemote({_G0_ESI})V", "goto :nfx_done",
+            ":nfx_miss", f"new-instance v1, {_G0_CSR}",
+            f"sget-object v2, {_G0_CSS}->ERROR_UNKNOWN_SLOT_ID:{_G0_CSS}",
+            f"invoke-direct {{v1, v2, v3, v3}}, {_G0_CSR_CTOR}",
+            ":nfx_done", f"invoke-interface {{p2, v1}}, {_G0_CB}->onResult({_G0_CSR})V", "return-void"]),
         ("saveSlot(", 3, lambda: [
             f"invoke-static {{p1, p2}}, {_G0_STORE}->write(Ljava/lang/String;Ljava/lang/String;)V",
             f"new-instance v0, {_G0_CSR}", f"sget-object v1, {_G0_CSS}->OK:{_G0_CSS}", "const/4 v2, 0x0",
