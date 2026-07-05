@@ -863,6 +863,105 @@ def patch_gamemaker(dec, report):
         note(st, "suppress-error-screen")
 
 
+# -----------------------------------------------------------------------------
+# GameMaker + oldest SDK (com.netflix.android.api), the "NetflixWrapper" glue shape (auth-only).
+#
+# A second GameMaker gen-0 shape (seen on Poinpy): the glue is named/shaped differently from the
+# Nfxa*/NetflixIntegration one above - it uses Netflix* methods (NetflixCheckUserAuth, NetflixShowMenu,
+# handleUserStateChange) and delivers the user-state to GML as a DsMap ASYNC EVENT rather than through
+# a slot-callback. And it has NO Netflix cloud-save (the glue never calls the cloudsave api) - progress
+# is a GameMaker-LOCAL save keyed to the player id (poinpy_<userLoginId>.sav), which already persists
+# offline. So AUTH is the only wall.
+#
+# Auth: the SDK event receiver calls handleUserStateChange(NetflixSdkState), which builds a DsMap
+# event `netflixUserStateChange` (userLoginId / userAccessToken / userChanged / locale) via
+# RunnerJNILib.jCreateDsMap + DsMapAddString and fires CreateAsynEventWithDSMap(mapId, socialEvent).
+# A non-empty userLoginId == signed in. NetflixCheckUserAuth() posts the SDK's network checkUserAuth.
+#
+# Patch (chokepoint, no network): rewrite handleUserStateChange to ALWAYS dispatch a synthetic
+# signed-in DsMap event, rewrite NetflixCheckUserAuth to call it directly, no-op SdkErrorActivity.
+# The engine (libyoyo) is arm-only, so strip_non_arm_libs is applied by the caller.
+# -----------------------------------------------------------------------------
+def _gm0w_find_glue(dec):
+    """GameMaker gen-0 glue of the 'NetflixWrapper' shape: builds the user-state as a DsMap async
+    event and exposes NetflixCheckUserAuth (Netflix* methods)."""
+    for d in sorted(dec.glob("smali*")):
+        for f in d.rglob("*.smali"):
+            try:
+                t = f.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if ("handleUserStateChange(" in t and "CreateAsynEventWithDSMap(" in t
+                    and "NetflixCheckUserAuth(" in t):
+                return f
+    return None
+
+
+def is_gamemaker_gen0_wrapper(dec):
+    """GameMaker + gen-0 SDK, 'NetflixWrapper' shape - auth-only (no Nfxa*/cloud-save glue)."""
+    return (find_smali_file(dec, "com/yoyogames/runner/RunnerJNILib") is not None
+            and find_smali_file(dec, "com/netflix/android/api/netflixsdk/NetflixSdk") is not None
+            and _gm_find_glue(dec) is None
+            and _gm0w_find_glue(dec) is not None)
+
+
+def patch_gamemaker_gen0_wrapper(dec, report):
+    """Force a synthetic signed-in DsMap user-state event, skip the network. No cloud-save."""
+    def note(status, name):
+        report[status].append(name)
+
+    jni = "Lcom/yoyogames/runner/RunnerJNILib;"
+    glue_f = _gm0w_find_glue(dec)
+    smdir = next(d for d in dec.glob("smali*") if glue_f.is_relative_to(d))
+    glue = "L" + str(glue_f.relative_to(smdir).with_suffix("")).replace("\\", "/") + ";"
+    t = glue_f.read_text(encoding="utf-8")
+
+    m = re.search(r"handleUserStateChange\((L[\w/$]+;)\)V", t)
+    if m is None:
+        sys.exit("! GameMaker gen-0 wrapper: handleUserStateChange signature not found")
+    state = m.group(1)
+
+    def add(k, v):
+        return [f'const-string v1, "{k}"', f'const-string v2, "{v}"',
+                f"invoke-static {{v0, v1, v2}}, {jni}->DsMapAddString(ILjava/lang/String;Ljava/lang/String;)V"]
+
+    signed_in = [
+        "const/4 v0, 0x0",
+        f"invoke-static {{v0, v0, v0}}, {jni}->jCreateDsMap([Ljava/lang/String;[Ljava/lang/String;[D)I",
+        "move-result v0",
+        *add("id", "netflixUserStateChange"),
+        *add("userChanged", "true"),
+        *add("userLoginId", "offline-player"),
+        *add("userAccessToken", "offline"),
+        *add("language", "en"),
+        *add("country", "US"),
+        *add("variant", ""),
+        *add("userGamerName", ""),
+        "const/16 v1, 0x46",
+        f"invoke-static {{v0, v1}}, {jni}->CreateAsynEventWithDSMap(II)V",
+        "return-void",
+    ]
+    check_auth = [
+        "const/4 v0, 0x0",
+        f"invoke-direct {{p0, v0}}, {glue}->handleUserStateChange({state})V",
+        "const-wide/16 v0, 0x0",
+        "return-wide v0",
+    ]
+    t, s1 = patch_method(t, f"handleUserStateChange({state})V", 3, signed_in)
+    t, s2 = patch_method(t, "NetflixCheckUserAuth()D", 2, check_auth)
+    if "patched" in (s1, s2):
+        glue_f.write_text(t, encoding="utf-8")
+    note(s1, "force-signed-in")
+    note(s2, "grant-auth")
+
+    ef = find_smali_file(dec, "com/netflix/mediaclient/ui/errors/SdkErrorActivity$Companion")
+    if ef is not None:
+        new, st = patch_method(ef.read_text(encoding="utf-8"), "startSdkErrorActivity(", 0, ["return-void"])
+        if st == "patched":
+            ef.write_text(new, encoding="utf-8")
+        note(st, "suppress-error-screen")
+
+
 def strip_non_arm_libs(dec):
     """GameMaker's engine (libyoyo.so) ships arm-only; if the x86/x86_64 lib dirs carry no engine,
     strip them so x86 emulators run the app under ARM translation instead of failing to find it."""
@@ -900,6 +999,10 @@ _GM2_WRITERES = "Lcom/netflix/games/storage/blobs/WritePlayerBlobResult;"
 _GM2_BLOBC = "Lcom/netflix/games/storage/blobs/BlobContainer;"
 _GM2_CONF = "Lcom/netflix/games/storage/blobs/Conflict;"
 _GM2_NOTFOUND = "Lcom/netflix/games/errors/ErrorCodes$BlobStore;->BLOB_NAME_NOT_FOUND:I"
+_GM2_DELRES = "Lcom/netflix/games/storage/blobs/DeletePlayerBlobResult;"
+_RESCOMP = "Lcom/netflix/games/NetflixResult$Companion;"
+_ACCESS_API = "com/netflix/games/player/access/AccessApi"
+_BLOB_API = "com/netflix/games/storage/blobs/BlobStoreApi"
 
 _GM2_OFFLINE_PROFILE = """.class public final Lcom/netflix/games/player/profiles/OfflineCurrentProfile;
 .super Lcom/netflix/games/player/profiles/CurrentProfile;
@@ -1210,6 +1313,139 @@ def patch_unreal_gen0(dec, report):
         note(st, "force-authenticated-event")
 
 
+# -----------------------------------------------------------------------------
+# gen-2 com.netflix.games SDK, NO engine bridge (Unity/GameMaker/UE4 glue absent).
+#
+# 2025 Unreal Engine 5 titles (e.g. Steel Paws / "Tower of Worlds") ship the newer request/grant
+# com.netflix.games SDK but have no Java glue class - the native game calls the SDK's OBFUSCATED
+# AccessApi and BlobStoreApi implementations directly through JNI. So there is nothing engine-side
+# to hook; instead we patch those SDK impls in place. This is engine-agnostic (works for any engine
+# that talks to the impls directly).
+#   1. SdkErrorActivity$Companion.startSdkErrorActivity(...) -> return-void
+#   2. every AccessApi impl: requestPlayerAccess(Callback) -> synthesize a granted PlayerAccessInfo
+#      and deliver it immediately (a non-error result == signed in), no network.
+#   3. every BlobStoreApi impl: back read/write/getIds/delete with a local file store so saves persist
+#      offline and "Load/Continue" enumerates them. The stock impls funnel every op through a server
+#      sync coroutine that hangs with no backend (the "saving" spinner never clears); the local store
+#      sidesteps it entirely. The game hands writePlayerBlob a BASE BlobContainer (not Base64-), so we
+#      pull raw bytes via getBlob()[B, base64 them for the string store, and hand back a plain
+#      BlobContainer([B) on read (the game reads its blob through the same getBlob()). read-miss ->
+#      BLOB_NAME_NOT_FOUND (-1001) so the game starts fresh rather than stalling.
+# -----------------------------------------------------------------------------
+def _decl_files_all(dec, typ):
+    """Every smali file whose header declares `.implements L{typ};` (there is usually one)."""
+    needle = f".implements L{typ};"
+    out = []
+    for d in sorted(dec.glob("smali*")):
+        for f in d.rglob("*.smali"):
+            try:
+                with open(f, encoding="utf-8", errors="ignore") as fh:
+                    head = "".join(fh.readline() for _ in range(15))
+                if needle in head:
+                    out.append(f)
+            except OSError:
+                pass
+    return out
+
+
+def is_gen2_nobridge(dec):
+    """gen-2 com.netflix.games SDK whose AccessApi impl the game calls directly (no engine glue)."""
+    return (find_smali_file(dec, _ACCESS_API) is not None
+            and find_smali_file(dec, _BLOB_API) is not None
+            and _decl_file(dec, _ACCESS_API, "implements") is not None
+            and _decl_file(dec, _BLOB_API, "implements") is not None)
+
+
+def patch_gen2_nobridge(dec, report):
+    """Patch the SDK's obfuscated AccessApi + BlobStoreApi impls in place (engine-agnostic gen-2)."""
+    def note(status, name):
+        report[status].append(name)
+
+    # 1. suppress the SDK error dialog (3-arg gen-2 variant)
+    ef = find_smali_file(dec, "com/netflix/mediaclient/ui/errors/SdkErrorActivity$Companion")
+    if ef is not None:
+        new, st = patch_method(ef.read_text(encoding="utf-8"), "startSdkErrorActivity(", 0, ["return-void"])
+        if st == "patched":
+            ef.write_text(new, encoding="utf-8")
+        note(st, "suppress-error-screen")
+
+    # 2. grant player access on every AccessApi impl
+    grant = [
+        f"new-instance v0, {_PAI}", 'const-string v1, "offline-player"',
+        f"invoke-direct {{v0, v1}}, {_PAI}-><init>(Ljava/lang/String;)V",
+        f"new-instance v1, {_RES}", "const/4 v2, 0x0",
+        f"invoke-direct {{v1, v0, v2}}, {_RES_CTOR}",
+        f"invoke-interface {{p1, v1}}, {_CB}->onResult({_RES})V", "return-void"]
+    hit = False
+    for f in _decl_files_all(dec, _ACCESS_API):
+        new, st = patch_method(f.read_text(encoding="utf-8"),
+                               "requestPlayerAccess(Lcom/netflix/games/Callback;)V", 3, grant)
+        if st in ("patched", "already"):
+            hit = True
+            if st == "patched":
+                f.write_text(new, encoding="utf-8")
+            note(st, "grant-player-access")
+    if not hit:
+        sys.exit("! gen-2 no-bridge: no AccessApi impl with requestPlayerAccess(Callback) found")
+
+    # 3. local blob store on every BlobStoreApi impl
+    def bodies(store):
+        read = [
+            f"invoke-static {{p1}}, {store}->read(Ljava/lang/String;)Ljava/lang/String;", "move-result-object v0",
+            "if-eqz v0, :nfx_miss",
+            "const/4 v1, 0x2",  # Base64.NO_WRAP
+            "invoke-static {v0, v1}, Landroid/util/Base64;->decode(Ljava/lang/String;I)[B", "move-result-object v1",
+            f"new-instance v0, {_GM2_BLOBC}", f"invoke-direct {{v0, v1}}, {_GM2_BLOBC}-><init>([B)V",
+            f"new-instance v1, {_GM2_READRES}", "const/4 v2, 0x0",
+            f"invoke-direct {{v1, v0, v2}}, {_GM2_READRES}-><init>({_GM2_BLOBC}{_GM2_CONF})V",
+            f"new-instance v0, {_RES}", f"invoke-direct {{v0, v1, v2}}, {_RES_CTOR}", "goto :nfx_deliver",
+            ":nfx_miss",
+            f"new-instance v1, {_ERR}", "const/16 v2, -0x3e9", 'const-string v3, "not found"',
+            f"invoke-direct {{v1, v2, v3}}, {_ERR}-><init>(ILjava/lang/String;)V",
+            "const/4 v2, 0x0", f"new-instance v0, {_RES}", f"invoke-direct {{v0, v2, v1}}, {_RES_CTOR}",
+            ":nfx_deliver", f"invoke-interface {{p2, v0}}, {_CB}->onResult({_RES})V", "return-void"]
+        write = [
+            f"invoke-virtual {{p2}}, {_GM2_BLOBC}->getBlob()[B", "move-result-object v0",
+            "const/4 v1, 0x2",  # Base64.NO_WRAP
+            "invoke-static {v0, v1}, Landroid/util/Base64;->encodeToString([BI)Ljava/lang/String;", "move-result-object v0",
+            f"invoke-static {{p1, v0}}, {store}->write(Ljava/lang/String;Ljava/lang/String;)V",
+            f"new-instance v0, {_GM2_WRITERES}", "const/4 v1, 0x0",
+            f"invoke-direct {{v0, v1}}, {_GM2_WRITERES}-><init>({_GM2_CONF})V",
+            f"new-instance v2, {_RES}", f"invoke-direct {{v2, v0, v1}}, {_RES_CTOR}",
+            f"invoke-interface {{p3, v2}}, {_CB}->onResult({_RES})V", "return-void"]
+        getids = [
+            f"invoke-static {{}}, {store}->list()Ljava/util/ArrayList;", "move-result-object v0",
+            f"sget-object v1, {_RES}->Companion:{_RESCOMP}",
+            f"invoke-virtual {{v1, v0}}, {_RESCOMP}->withData(Ljava/lang/Object;){_RES}", "move-result-object v0",
+            f"invoke-interface {{p1, v0}}, {_CB}->onResult({_RES})V", "return-void"]
+        delete = [
+            f"invoke-static {{p1}}, {store}->delete(Ljava/lang/String;)V",
+            f"new-instance v0, {_GM2_DELRES}", "const/4 v1, 0x0",
+            f"invoke-direct {{v0, v1}}, {_GM2_DELRES}-><init>({_GM2_CONF})V",
+            f"new-instance v2, {_RES}", f"invoke-direct {{v2, v0, v1}}, {_RES_CTOR}",
+            f"invoke-interface {{p2, v2}}, {_CB}->onResult({_RES})V", "return-void"]
+        return read, write, getids, delete
+
+    for f in _decl_files_all(dec, _BLOB_API):
+        smdir = next(d for d in dec.glob("smali*") if f.is_relative_to(d))
+        pkg = str(f.relative_to(smdir).parent).replace("\\", "/")
+        store = f"L{pkg}/NfxBlobStore;"
+        read, write, getids, delete = bodies(store)
+        t = f.read_text(encoding="utf-8")
+        t, s1 = patch_method(t, "readPlayerBlob(Ljava/lang/String;Lcom/netflix/games/Callback;)V", 4, read)
+        t, s2 = patch_method(t, "writePlayerBlob(Ljava/lang/String;Lcom/netflix/games/storage/blobs/BlobContainer;Lcom/netflix/games/Callback;)V", 3, write)
+        t, s3 = patch_method(t, "getPlayerBlobs(Lcom/netflix/games/Callback;)V", 2, getids)
+        t, s4 = patch_method(t, "deletePlayerBlob(Ljava/lang/String;Lcom/netflix/games/Callback;)V", 3, delete)
+        if "patched" in (s1, s2, s3, s4):
+            f.write_text(t, encoding="utf-8")
+            (f.parent / "NfxBlobStore.smali").write_text(
+                _g0_slot_store_smali(None).replace("com/netflix/unity/impl/NfxSlotStore", store[1:-1]),
+                encoding="utf-8")
+            note("patched", "local-blob-store")
+        elif "already" in (s1, s2, s3, s4):
+            note("already", "local-blob-store")
+
+
 def resolve_tools(args):
     cfg = {}
     local = HERE / "config.local.json"
@@ -1312,7 +1548,10 @@ def main():
         gamemaker_gen2 = (not has_unity_bridge) and (not gamemaker_gen0) and is_gamemaker_gen2_sdk(dec)
         gamemaker = gamemaker_gen0 or gamemaker_gen2
         unreal_gen0 = (not has_unity_bridge) and (not gamemaker) and is_unreal_gen0(dec)
-        if not has_unity_bridge and not gamemaker and not unreal_gen0:
+        gen2_nobridge = (not has_unity_bridge) and (not gamemaker) and (not unreal_gen0) and is_gen2_nobridge(dec)
+        gamemaker_gen0_wrapper = (not has_unity_bridge) and (not gamemaker) and (not unreal_gen0) \
+            and (not gen2_nobridge) and is_gamemaker_gen0_wrapper(dec)
+        if not (has_unity_bridge or gamemaker or unreal_gen0 or gen2_nobridge or gamemaker_gen0_wrapper):
             sys.exit("! no Netflix Games glue found (Unity, GameMaker, or Unreal). "
                      "this doesn't look like a Netflix game.")
 
@@ -1329,6 +1568,13 @@ def main():
         elif unreal_gen0:
             print("      Unreal Engine + oldest SDK (com.netflix.android.api; patching the UE4 JNI glue, auth-only)")
             patch_unreal_gen0(dec, report)
+        elif gen2_nobridge:
+            print("      newer com.netflix.games SDK, no engine glue (patching the SDK AccessApi + BlobStoreApi impls directly)")
+            patch_gen2_nobridge(dec, report)
+        elif gamemaker_gen0_wrapper:
+            print("      GameMaker + oldest SDK, 'NetflixWrapper' glue (auth-only, DsMap user-state event; local GameMaker save)")
+            patch_gamemaker_gen0_wrapper(dec, report)
+            strip_non_arm_libs(dec)
         elif is_gen0_sdk(dec):
             print("      oldest SDK (com.netflix.android.api auth model; local slot store for saves)")
             patch_gen0(dec, report)
