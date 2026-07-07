@@ -83,36 +83,35 @@ bridge; the tool finds it by parsing:
 > `INSTALL_FAILED_DUPLICATE_PERMISSION`. Removing that one `<permission>` is a per-game step;
 > standalone installs are unaffected.
 
-## How it works: iOS (gen-2 Unity only so far)
+## How it works: iOS
 
-**Support so far is limited to the gen-2 `com.netflix.games` SDK reached through the `ngp_*`
-C ABI (the Unity plugin bridge).** Older generations and other engine bindings are not
-handled yet; the tool aborts on anything it does not recognise.
+On iOS the SDK ships as a native framework, not smali, and the Unity engine reaches it over a
+flat C ABI: `extern "C"` `ngp_*` functions where every result comes back as a JSON string. The
+gate lives entirely behind that boundary. A Mach-O cannot be reassembled like smali, so instead
+of rewriting the SDK the tool overrides those C functions with dyld interposing: it ships a
+prebuilt arm64 dylib, copies it into `Frameworks/`, and adds one `LC_LOAD_DYLIB` to the main
+executable and the engine framework, editing only the Mach-O header padding so every framework's
+code stays byte-for-byte the same. The SDK callbacks marshal JSON over the C ABI, and the engine
+stores its pending task before the native call, so the shim answers synchronously with the exact
+JSON the engine expects. The SDK symbols are `weak_import`, so one prebuilt binary fits every
+title of that generation. The output is unsigned; the sideloader re-signs the bundle, shim
+included. Each shim is rebuildable from source (see its `BUILD.md`).
 
-On iOS the SDK ships as a native `NetflixGames.framework`, not smali, and the engine reaches
-it over a flat C ABI: `extern "C"` `ngp_*` functions where every result comes back as a JSON
-string. The gate lives entirely behind that boundary. The `ngp_*` functions are the iOS
-analog of the Android SDK methods above:
+Two SDK generations are handled, both through the Unity plugin's C ABI:
 
-| Android SDK method | iOS C function |
-| --- | --- |
-| `doRequestPlayerAccess` | `ngp_request_player_access` |
-| `readBlob` / `getBlobs` / `writeBlob` | `ngp_blob_store_read` / `_get_blobs` / `_write` |
+- **gen-2 `com.netflix.games`** (`NetflixGames.framework`): `ngp_request_player_access` hands
+  back a granted `PlayerAccessInfo` for a synthetic offline member; the access-UI call is a
+  no-op; `ngp_blob_store_*` return an offline "no cloud save" result.
+- **gen-0 NGP** (`NGP.framework`): auth is event-driven, so the shim captures the event
+  dispatcher and, on `ngp_check_user_authentication`, fires a synthetic `onUserStateChange`
+  signed-in event. These titles keep progress only in the cloud slot store, so the shim also
+  runs a local slot store (`ngp_read_slot`/`ngp_save_slot`/...) under the app's Documents dir,
+  with read-miss returning `ErrorUnknownSlotId` so the game starts fresh then saves.
 
-A Mach-O cannot be reassembled like smali, so instead of rewriting the SDK the tool overrides
-those C functions with dyld interposing. It ships a prebuilt arm64 dylib
-(`netflix_patcher/ios/shims/gen2_unity/`) that answers the calls locally:
-`ngp_request_player_access` hands back a granted `PlayerAccessInfo` for a synthetic offline
-member with a stable player id (so local saves persist); the access-UI call is a no-op; the
-blob-store calls return an offline "no cloud save" result. The SDK's callbacks marshal JSON
-over the C ABI, and the engine stores its pending task before making the native call, so the
-shim answers synchronously with the exact JSON the engine expects: no server, no waiting.
-
-The tool copies the shim framework into `Frameworks/` and adds one `LC_LOAD_DYLIB` to the
-main executable and the engine framework, editing only the Mach-O header padding so every
-framework's code stays byte-for-byte the same. The SDK symbols are `weak_import`, so one
-prebuilt binary fits any gen-2 title. The output is unsigned; the sideloader re-signs the
-whole bundle, shim included. To rebuild the shim from source, see its `BUILD.md`.
+**Not handled: titles that reach the SDK through its Obj-C/Swift API rather than the C ABI**
+(native UE4 and GameMaker games). They import no `ngp_*` symbol, so interposing does nothing;
+the tool detects this and aborts with a clear message. Supporting them needs an Obj-C-swizzling
+handler, which is still being worked on.
 
 ## Project layout
 
@@ -130,10 +129,11 @@ netflix_patcher/
     gen2_nobridge.py           gen-2 SDK, no engine glue
     tools.py, pipeline.py      toolchain resolution, orchestration
   ios/
-    handlers.py                one handler per (SDK generation x framework)
+    handlers.py                one handler per (SDK generation x engine binding)
     macho.py                   Mach-O load-command injection
     pipeline.py                orchestration
-    shims/gen2_unity/          prebuilt dylib + source
+    shims/gen2_unity/          prebuilt dylib + source (gen-2 NetflixGames)
+    shims/gen0_unity/          prebuilt dylib + source (gen-0 NGP)
 ```
 
 Each SDK generation and engine is its own module. Adding a new one, on either platform, is a

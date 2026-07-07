@@ -37,10 +37,13 @@ def run_ios(in_path, out_path, args):
 
         handler = next((h for h in HANDLERS if h.detect(app)), None)
         if handler is None:
-            if (app / "Frameworks" / "NetflixGames.framework").exists():
-                sys.exit("! NetflixGames.framework is present but no handler matched its SDK "
-                         "generation yet (only the gen-2 ngp_ C ABI is supported so far).")
-            sys.exit("! no NetflixGames.framework in the bundle - this doesn't look like a Netflix iOS game.")
+            fw = app / "Frameworks"
+            sdk = next((n for n in ("NetflixGames.framework", "NGP.framework") if (fw / n).exists()), None)
+            if sdk:
+                sys.exit(f"! {sdk} is present but no handler matched. The engine reaches the SDK "
+                         "through its Obj-C/Swift API rather than the ngp_* C ABI (UE4 / GameMaker), "
+                         "which no handler covers yet.")
+            sys.exit("! no Netflix SDK framework in the bundle - this doesn't look like a Netflix iOS game.")
         print(f"[2/3] {handler.summary}")
         handler.apply(app)
         if args.keep_cloud_save:

@@ -1,7 +1,12 @@
-"""iOS SDK handlers, one per (SDK generation x engine framework).
+"""iOS SDK handlers, one per (SDK generation x engine binding).
 
-To support a new generation or framework, add a handler with detect()/apply() and register
-it in HANDLERS. run_ios() applies the first handler whose detect() matches.
+To support a new generation or binding, add a handler with detect()/apply() and register it
+in HANDLERS. run_ios() applies the first handler whose detect() matches.
+
+So far every handler neutralises the gate by dyld-interposing the SDK's flat `ngp_*` C ABI,
+which is the bridge Unity (and other C-P/Invoke engines) call. Native engines that talk to
+the SDK through its Obj-C/Swift API instead (UE4, GameMaker) do not import that C ABI, so
+these handlers correctly decline them.
 """
 import shutil
 import sys
@@ -33,30 +38,21 @@ def find_app_bundle(payload_dir):
     return apps[0]
 
 
-class Gen2UnityHandler:
-    """gen-2 com.netflix.games SDK exposed as the flat ngp_* C ABI (the Unity plugin bridge,
-    and any other engine that calls the SDK through it). The gate is neutralised by a prebuilt
-    dyld-interpose dylib that answers the ngp_* calls with a granted / offline result."""
+class CAbiHandler:
+    """Interpose the SDK's flat C ABI with a prebuilt shim. Subclasses set the SDK framework,
+    the marker symbol the engine imports, and which shim to inject."""
 
-    key = "gen2-unity"
-    summary = "gen-2 com.netflix.games SDK, ngp_* C ABI (Unity IL2CPP bridge)"
-
-    sdk_framework = "NetflixGames.framework"
-    sdk_binary = "NetflixGames"
-    sdk_marker = b"ngp_request_player_access"
-
-    shim_name = "gen2_unity"
     shim_framework = "NetflixOffline.framework"
     shim_binary = "NetflixOffline"
     shim_load_path = "@rpath/NetflixOffline.framework/NetflixOffline"
 
-    def detect(self, app):
+    def _sdk_present(self, app):
         b = app / "Frameworks" / self.sdk_framework / self.sdk_binary
         return b.exists() and self.sdk_marker in b.read_bytes()
 
-    def _engine_binaries(self, app):
-        # Frameworks that import the SDK's C ABI (the engine glue). Wire the shim into these
-        # too so the interpose is registered in the same dlopen batch that binds their calls.
+    def _importers(self, app):
+        """Framework binaries that call the SDK's C ABI (they import the marker) - the engine
+        glue. The main executable is always wired too, so it is not included here."""
         skip = {self.sdk_framework, "NetflixGames-companion.framework", self.shim_framework}
         out = []
         for d in sorted((app / "Frameworks").glob("*.framework")):
@@ -70,6 +66,18 @@ class Gen2UnityHandler:
                 pass
         return out
 
+    def _main_calls_abi(self, app):
+        b = _bundle_binary(app)
+        try:
+            return b.exists() and self.sdk_marker in b.read_bytes()
+        except Exception:
+            return False
+
+    def detect(self, app):
+        # SDK present AND some binary actually calls its C ABI. A title that reaches the SDK
+        # through its Obj-C/Swift API (UE4, GameMaker) imports no ngp_ symbol, so it declines.
+        return self._sdk_present(app) and (self._importers(app) or self._main_calls_abi(app))
+
     def apply(self, app):
         src = SHIMS / self.shim_name / self.shim_framework
         if not (src / self.shim_binary).exists():
@@ -77,13 +85,14 @@ class Gen2UnityHandler:
         dst = app / "Frameworks" / self.shim_framework
         shutil.rmtree(dst, ignore_errors=True)
         shutil.copytree(src, dst)
-        print(f"      installed {self.shim_framework}")
+        print(f"      installed {self.shim_framework} ({self.shim_name})")
 
         main_bin = _bundle_binary(app)
-        if not main_bin.exists():
-            sys.exit(f"! could not find the app's main executable ({main_bin.name})")
+        # main executable = interpose registered in the launch closure; engine frameworks =
+        # wired in the same dlopen batch that binds their ngp_ calls.
+        targets = [main_bin] + [b for b in self._importers(app) if b != main_bin]
         wired = 0
-        for b in [main_bin] + [e for e in self._engine_binaries(app) if e != main_bin]:
+        for b in targets:
             res = macho_add_load_dylib(b, self.shim_load_path)
             if "added" in res or "already" in res:
                 print(f"      wired -> {b.name}")
@@ -94,4 +103,25 @@ class Gen2UnityHandler:
             sys.exit("! could not wire the shim into any binary (unexpected Mach-O layout).")
 
 
-HANDLERS = [Gen2UnityHandler()]
+class Gen2UnityHandler(CAbiHandler):
+    """gen-2 com.netflix.games SDK (NetflixGames.framework). Request-and-grant player access."""
+    key = "gen2-unity"
+    summary = "gen-2 com.netflix.games SDK, ngp_* C ABI (Unity IL2CPP bridge)"
+    sdk_framework = "NetflixGames.framework"
+    sdk_binary = "NetflixGames"
+    sdk_marker = b"ngp_request_player_access"
+    shim_name = "gen2_unity"
+
+
+class Gen0UnityHandler(CAbiHandler):
+    """gen-0 NGP SDK (NGP.framework). Event-driven auth: fire a synthetic onUserStateChange
+    signed-in event, plus a local slot store so cloud-only saves persist."""
+    key = "gen0-unity"
+    summary = "gen-0 NGP SDK, ngp_* C ABI, event-driven auth (Unity IL2CPP bridge)"
+    sdk_framework = "NGP.framework"
+    sdk_binary = "NGP"
+    sdk_marker = b"ngp_check_user_authentication"
+    shim_name = "gen0_unity"
+
+
+HANDLERS = [Gen2UnityHandler(), Gen0UnityHandler()]
