@@ -6,6 +6,7 @@ config.local.json
 *.apk
 *.apkm
 *.xapk
+*.ipa
 tools/*.jar
 tools/*.zip
 nfxpatch_*/
