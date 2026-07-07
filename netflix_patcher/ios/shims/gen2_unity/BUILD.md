@@ -2,11 +2,11 @@
 
 `NetflixOffline.framework/NetflixOffline` (here, next to this file) is a prebuilt arm64
 dylib. The tool ships it prebuilt so you don't need an Apple toolchain to patch an IPA. You
-only need to rebuild if you change `netflix_offline_ios.c`.
+only need to rebuild if you change `netflix_offline_gen2.c`.
 
 It's a tiny dyld-interpose shim: it overrides the Netflix SDK's `ngp_*` C-ABI functions
 with local ones that hand back a "granted / offline" result. See the header comment in
-`netflix_offline_ios.c` for how it works and the exact JSON wire formats.
+`netflix_offline_gen2.c` for how it works and the exact JSON wire formats.
 
 ## Requirements
 
@@ -21,10 +21,10 @@ with local ones that hand back a "granted / offline" result. See the header comm
 
 ```sh
 clang -target arm64-apple-ios12.0 -O2 -fno-stack-protector -fno-exceptions -ffreestanding \
-      -c netflix_offline_ios.c -o netflix_offline_ios.o
+      -c netflix_offline_gen2.c -o netflix_offline_gen2.o
 
 ld64.lld -arch arm64 -dylib -o NetflixOffline.framework/NetflixOffline \
-      netflix_offline_ios.o \
+      netflix_offline_gen2.o \
       /path/to/AnyTitle.app/Frameworks/NetflixGames.framework/NetflixGames \
       -install_name "@rpath/NetflixOffline.framework/NetflixOffline" \
       -platform_version ios 12.0 17.0
