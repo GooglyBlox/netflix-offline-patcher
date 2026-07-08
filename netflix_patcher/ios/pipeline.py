@@ -22,6 +22,34 @@ def is_ipa(path):
     return False
 
 
+def _relax_install_restrictions(app):
+    """Strip App Store distribution restrictions that block sideloading: a UISupportedDevices
+    allowlist (limits install to specific device models - a common dumped-IPA artifact) and the
+    ITSDRMScheme FairPlay marker (the binaries are already decrypted). The sideloader re-signs
+    the bundle, so editing the Info.plist here is fine."""
+    import plistlib
+    info = app / "Info.plist"
+    if not info.exists():
+        return
+    try:
+        d = plistlib.loads(info.read_bytes())
+    except Exception:
+        return
+    removed = [k for k in ("UISupportedDevices", "ITSDRMScheme") if k in d]
+    for k in removed:
+        del d[k]
+    # expose Documents over Files/iTunes so saves are backup-able (and the diagnostic log
+    # is reachable) on a non-jailbroken device.
+    changed = bool(removed)
+    for k in ("UIFileSharingEnabled", "LSSupportsOpeningDocumentsInPlace"):
+        if d.get(k) is not True:
+            d[k] = True; changed = True
+    if changed:
+        info.write_bytes(plistlib.dumps(d, fmt=plistlib.FMT_BINARY))
+        note = (", removed " + ", ".join(removed)) if removed else ""
+        print(f"      relaxed install restrictions: file sharing on{note}")
+
+
 def run_ios(in_path, out_path, args):
     work = Path(tempfile.mkdtemp(prefix="nfxpatch_ios_"))
     print(f"[*] work dir: {work}")
@@ -34,6 +62,7 @@ def run_ios(in_path, out_path, args):
             sys.exit("! IPA has no Payload/ (is this really an .ipa?)")
         app = find_app_bundle(payload)
         print(f"      app: {app.name}")
+        _relax_install_restrictions(app)
 
         handler = next((h for h in HANDLERS if h.detect(app)), None)
         if handler is None:

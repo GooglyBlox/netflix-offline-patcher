@@ -81,3 +81,43 @@ def macho_add_load_dylib(path, load_name):
     if "added" in results:
         Path(path).write_bytes(data)
     return results
+
+
+LC_BUILD_VERSION = 0x32
+LC_VERSION_MIN_IPHONEOS = 0x25
+
+
+def _pack_version(version_str):
+    """"10.0" / "16.2" / "9" -> the uint32 (major<<16)|(minor<<8)|patch. None if unparseable."""
+    try:
+        parts = [int(x) for x in (str(version_str).split(".") + ["0", "0"])[:3]]
+    except ValueError:
+        return None
+    return (parts[0] << 16) | (parts[1] << 8) | parts[2]
+
+
+def macho_set_min_os(path, version_str):
+    """Set the minimum-OS field of every slice's LC_BUILD_VERSION / LC_VERSION_MIN_IPHONEOS in
+    place (a single uint32, no layout change). iOS refuses to install an app whose embedded
+    framework requires a newer OS than the app, so we match the shim to the target."""
+    ver = _pack_version(version_str)
+    if ver is None:
+        return False
+    import struct as _s
+    data = bytearray(Path(path).read_bytes())
+    changed = False
+    for slice_off, _ in _macho_thin_slices(data):
+        if int.from_bytes(data[slice_off:slice_off + 4], "little") != MH_MAGIC_64:
+            continue
+        ncmds = _s.unpack_from("<I", data, slice_off + 16)[0]
+        off = slice_off + 0x20
+        for _ in range(ncmds):
+            cmd, cmdsize = _s.unpack_from("<II", data, off)
+            if cmd == LC_BUILD_VERSION:
+                _s.pack_into("<I", data, off + 12, ver); changed = True   # minos
+            elif cmd == LC_VERSION_MIN_IPHONEOS:
+                _s.pack_into("<I", data, off + 8, ver); changed = True     # version
+            off += cmdsize
+    if changed:
+        Path(path).write_bytes(data)
+    return changed

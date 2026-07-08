@@ -12,9 +12,35 @@ import shutil
 import sys
 
 from .. import PKG_DIR
-from .macho import macho_add_load_dylib
+from .macho import macho_add_load_dylib, macho_set_min_os
 
 SHIMS = PKG_DIR / "ios" / "shims"
+
+
+def _app_min_os(app):
+    info = app / "Info.plist"
+    if info.exists():
+        import plistlib
+        try:
+            return plistlib.loads(info.read_bytes()).get("MinimumOSVersion")
+        except Exception:
+            pass
+    return None
+
+
+def _match_shim_min_os(shim_framework_dir, shim_binary, version):
+    """iOS won't install an app whose embedded framework needs a newer OS than the app, so
+    set the installed shim's min OS (Mach-O + Info.plist) to the app's."""
+    macho_set_min_os(shim_framework_dir / shim_binary, version)
+    plist = shim_framework_dir / "Info.plist"
+    if plist.exists():
+        import plistlib
+        try:
+            d = plistlib.loads(plist.read_bytes())
+            d["MinimumOSVersion"] = version
+            plist.write_bytes(plistlib.dumps(d))
+        except Exception:
+            pass
 
 
 def _bundle_binary(bundle_dir):
@@ -85,7 +111,10 @@ class CAbiHandler:
         dst = app / "Frameworks" / self.shim_framework
         shutil.rmtree(dst, ignore_errors=True)
         shutil.copytree(src, dst)
-        print(f"      installed {self.shim_framework} ({self.shim_name})")
+        min_os = _app_min_os(app)
+        if min_os:
+            _match_shim_min_os(dst, self.shim_binary, min_os)
+        print(f"      installed {self.shim_framework} ({self.shim_name}, min iOS {min_os or 'default'})")
 
         main_bin = _bundle_binary(app)
         # main executable = interpose registered in the launch closure; engine frameworks =
