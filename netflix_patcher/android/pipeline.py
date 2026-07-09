@@ -28,8 +28,17 @@ def unpack_input(path, workdir):
         apks = list(ex.rglob("*.apk"))
         if not apks:
             sys.exit("! no .apk inside the bundle")
+
+        def _has_classes_dex(a):
+            try:
+                with zipfile.ZipFile(a) as z:
+                    return any(n == "classes.dex" for n in z.namelist())
+            except Exception:
+                return False
+
         base = (next((a for a in apks if a.name == "base.apk"), None)
-                or next((a for a in apks if not re.search(r"config|split", a.name, re.I)), None)
+                or next((a for a in apks if _has_classes_dex(a)), None)
+                or next((a for a in apks if not re.search(r"config|split|install.?time|asset", a.name, re.I)), None)
                 or max(apks, key=lambda a: a.stat().st_size))
         return base, [a for a in apks if a != base]
     return path, []
