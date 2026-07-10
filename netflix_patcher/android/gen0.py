@@ -306,7 +306,7 @@ def patch_gen0(dec, report):
     for sig, locals_, mk in (
         # A read MISS returns ERROR_UNKNOWN_SLOT_ID (not OK+empty): the game must be told the slot
         # does not exist yet, or it assumes an already-present empty slot and never writes progress
-        # (verified on Pirates: Severed Seas, whose save only lands once the slot reads as "unknown").
+        # (some titles only land their first save once the slot reads as "unknown").
         ("readSlot(", 4, lambda: [
             f"invoke-static {{p1}}, {_G0_STORE}->read(Ljava/lang/String;)Ljava/lang/String;",
             "move-result-object v0", "const/4 v3, 0x0", "if-eqz v0, :nfx_miss",
