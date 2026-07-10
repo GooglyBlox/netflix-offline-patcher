@@ -85,33 +85,45 @@ bridge; the tool finds it by parsing:
 
 ## How it works: iOS
 
-On iOS the SDK ships as a native framework, not smali, and the Unity engine reaches it over a
-flat C ABI: `extern "C"` `ngp_*` functions where every result comes back as a JSON string. The
-gate lives entirely behind that boundary. A Mach-O cannot be reassembled like smali, so instead
-of rewriting the SDK the tool overrides those C functions with dyld interposing: it ships a
-prebuilt arm64 dylib, copies it into `Frameworks/`, and adds one `LC_LOAD_DYLIB` to the main
-executable and the engine framework, editing only the Mach-O header padding so every framework's
-code stays byte-for-byte the same. The SDK callbacks marshal JSON over the C ABI, and the engine
-stores its pending task before the native call, so the shim answers synchronously with the exact
-JSON the engine expects. The SDK symbols are `weak_import`, so one prebuilt binary fits every
-title of that generation. The output is unsigned; the sideloader re-signs the bundle, shim
-included. Each shim is rebuildable from source (see its `BUILD.md`).
+On iOS the SDK ships as a native framework, not smali. A Mach-O cannot be reassembled like
+smali, so the tool ships prebuilt arm64 shim dylibs: it copies one into `Frameworks/` and adds
+one `LC_LOAD_DYLIB` to the main executable (and any engine framework), editing only the Mach-O
+header padding so every framework's code stays byte-for-byte the same. The output is unsigned;
+the sideloader re-signs the bundle, shim included. Each shim is rebuildable from source (see its
+`BUILD.md`). How the shim reaches the gate depends on how the game's engine reaches the SDK -
+there are two bindings, and the tool auto-detects which by what the game's own binaries import.
 
-Two SDK generations are handled, both through the Unity plugin's C ABI:
+**C-ABI binding (Unity).** The Unity plugin reaches the SDK over a flat C ABI: `extern "C"`
+`ngp_*` functions where every result comes back as a JSON string. The shim overrides those C
+functions by dyld interposing (a `__DATA,__interpose` table). The engine stores its pending task
+before the native call, so the shim answers with the exact JSON the engine expects. The `ngp_*`
+symbols are `weak_import`, so one prebuilt binary fits every title of that generation.
 
 - **gen-2 `com.netflix.games`** (`NetflixGames.framework`): `ngp_request_player_access` hands
-  back a granted `PlayerAccessInfo` for a synthetic offline member; the access-UI call is a
-  no-op; `ngp_blob_store_*` return an offline "no cloud save" result.
+  back a granted `PlayerAccessInfo`; the access-UI call is a no-op; `ngp_blob_store_*` return an
+  offline "no cloud save" result. (shim `gen2_unity`)
 - **gen-0 NGP** (`NGP.framework`): auth is event-driven, so the shim captures the event
   dispatcher and, on `ngp_check_user_authentication`, fires a synthetic `onUserStateChange`
-  signed-in event. These titles keep progress only in the cloud slot store, so the shim also
-  runs a local slot store (`ngp_read_slot`/`ngp_save_slot`/...) under the app's Documents dir,
-  with read-miss returning `ErrorUnknownSlotId` so the game starts fresh then saves.
+  signed-in event, plus a local slot store (read-miss = `ErrorUnknownSlotId`). (shim `gen0_unity`)
 
-**Not handled: titles that reach the SDK through its Obj-C/Swift API rather than the C ABI**
-(native UE4 and GameMaker games). They import no `ngp_*` symbol, so interposing does nothing;
-the tool detects this and aborts with a clear message. Supporting them needs an Obj-C-swizzling
-handler, which is still being worked on.
+**Obj-C/Swift binding (Unreal, GameMaker).** These engines import no `ngp_*` symbol - they reach
+the SDK through its Objective-C / Swift `@objc` API (they import `_OBJC_CLASS_$_NetflixSDK`, or the
+Swift `NetflixGamesSDK` class + `NetflixBlobContainer`). There is nothing to interpose, so the shim
+instead **swizzles the SDK's Obj-C methods** in a load-time constructor (using the Obj-C runtime C
+API, no Apple SDK needed). Swizzling patches the shared class objects process-wide, so wiring the
+main executable is enough. Where the SDK returns model objects, the shim hands back the real class
+with its ivars set, or a small duck-typed stand-in built at runtime.
+
+- **gen-0 NGP Obj-C facade** (Unreal): swizzle `+[NetflixSDK checkUserAuth]` to deliver a synthetic
+  signed-in `NetflixSDKState`(`NetflixProfile`) to the registered event receiver;
+  `registerEventReceiver:` captures it; UI-present calls are no-ops; the slot methods back a local
+  file store. (shim `gen0_objc`)
+- **gen-2 Swift `@objc` API** (GameMaker): grant player access through whichever model the title
+  uses - the completion form (`requestPlayerAccessWithCompletionHandler:`) or the event form
+  (`registerEventHandler:` + `showNetflixAccessUIIfNecessary` -> a synthetic granted
+  `onPlayerAccessChangeWithAccessEvent:`); `currentProfileAndReturnError:` returns an offline
+  profile; the blob store is backed by a local file store (read-miss = `blobNameNotFound`, -1001).
+  (shim `gen2_objc`)
 
 ## Project layout
 
@@ -132,8 +144,11 @@ netflix_patcher/
     handlers.py                one handler per (SDK generation x engine binding)
     macho.py                   Mach-O load-command injection
     pipeline.py                orchestration
-    shims/gen2_unity/          prebuilt dylib + source (gen-2 NetflixGames)
-    shims/gen0_unity/          prebuilt dylib + source (gen-0 NGP)
+    shims/nfx_objc_common.h    shared Obj-C-runtime/libc/dispatch preamble (Obj-C shims)
+    shims/gen2_unity/          prebuilt dylib + source - C-ABI interpose (gen-2, Unity)
+    shims/gen0_unity/          prebuilt dylib + source - C-ABI interpose (gen-0, Unity)
+    shims/gen2_objc/           prebuilt dylib + source - Obj-C swizzle (gen-2, GameMaker)
+    shims/gen0_objc/           prebuilt dylib + source - Obj-C swizzle (gen-0, Unreal)
 ```
 
 Each SDK generation and engine is its own module. Adding a new one, on either platform, is a

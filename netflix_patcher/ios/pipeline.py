@@ -69,9 +69,9 @@ def run_ios(in_path, out_path, args):
             fw = app / "Frameworks"
             sdk = next((n for n in ("NetflixGames.framework", "NGP.framework") if (fw / n).exists()), None)
             if sdk:
-                sys.exit(f"! {sdk} is present but no handler matched. The engine reaches the SDK "
-                         "through its Obj-C/Swift API rather than the ngp_* C ABI (UE4 / GameMaker), "
-                         "which no handler covers yet.")
+                sys.exit(f"! {sdk} is present but no handler matched. The game imports neither the "
+                         "SDK's ngp_* C ABI (Unity) nor its Obj-C class markers (UE4 / GameMaker) - "
+                         "an unrecognised engine binding. Re-check with the objc metadata dumper.")
             sys.exit("! no Netflix SDK framework in the bundle - this doesn't look like a Netflix iOS game.")
         print(f"[2/3] {handler.summary}")
         handler.apply(app)

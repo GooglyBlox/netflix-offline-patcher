@@ -64,6 +64,31 @@ def find_app_bundle(payload_dir):
     return apps[0]
 
 
+def _install_shim(app, shim_name, shim_framework, shim_binary, shim_load_path, targets):
+    """Copy a prebuilt shim framework into the app, match its min-OS to the app, and add an
+    LC_LOAD_DYLIB for it to each target binary. Shared by the C-ABI and Obj-C handlers."""
+    src = SHIMS / shim_name / shim_framework
+    if not (src / shim_binary).exists():
+        sys.exit(f"! prebuilt shim missing at {src}")
+    dst = app / "Frameworks" / shim_framework
+    shutil.rmtree(dst, ignore_errors=True)
+    shutil.copytree(src, dst)
+    min_os = _app_min_os(app)
+    if min_os:
+        _match_shim_min_os(dst, shim_binary, min_os)
+    print(f"      installed {shim_framework} ({shim_name}, min iOS {min_os or 'default'})")
+    wired = 0
+    for b in targets:
+        res = macho_add_load_dylib(b, shim_load_path)
+        if "added" in res or "already" in res:
+            print(f"      wired -> {b.name}")
+            wired += 1
+        else:
+            print(f"      (skipped {b.name}: {res})")
+    if not wired:
+        sys.exit("! could not wire the shim into any binary (unexpected Mach-O layout).")
+
+
 class CAbiHandler:
     """Interpose the SDK's flat C ABI with a prebuilt shim. Subclasses set the SDK framework,
     the marker symbol the engine imports, and which shim to inject."""
@@ -105,31 +130,12 @@ class CAbiHandler:
         return self._sdk_present(app) and (self._importers(app) or self._main_calls_abi(app))
 
     def apply(self, app):
-        src = SHIMS / self.shim_name / self.shim_framework
-        if not (src / self.shim_binary).exists():
-            sys.exit(f"! prebuilt shim missing at {src}")
-        dst = app / "Frameworks" / self.shim_framework
-        shutil.rmtree(dst, ignore_errors=True)
-        shutil.copytree(src, dst)
-        min_os = _app_min_os(app)
-        if min_os:
-            _match_shim_min_os(dst, self.shim_binary, min_os)
-        print(f"      installed {self.shim_framework} ({self.shim_name}, min iOS {min_os or 'default'})")
-
         main_bin = _bundle_binary(app)
         # main executable = interpose registered in the launch closure; engine frameworks =
         # wired in the same dlopen batch that binds their ngp_ calls.
         targets = [main_bin] + [b for b in self._importers(app) if b != main_bin]
-        wired = 0
-        for b in targets:
-            res = macho_add_load_dylib(b, self.shim_load_path)
-            if "added" in res or "already" in res:
-                print(f"      wired -> {b.name}")
-                wired += 1
-            else:
-                print(f"      (skipped {b.name}: {res})")
-        if not wired:
-            sys.exit("! could not wire the shim into any binary (unexpected Mach-O layout).")
+        _install_shim(app, self.shim_name, self.shim_framework, self.shim_binary,
+                      self.shim_load_path, targets)
 
 
 class Gen2UnityHandler(CAbiHandler):
@@ -153,4 +159,74 @@ class Gen0UnityHandler(CAbiHandler):
     shim_name = "gen0_unity"
 
 
-HANDLERS = [Gen2UnityHandler(), Gen0UnityHandler()]
+class ObjcSwizzleHandler:
+    """Titles that reach the SDK through its Obj-C / Swift @objc API instead of the ngp_* C ABI
+    (UE4, GameMaker). There is nothing to interpose, so the shim swizzles the SDK's Obj-C methods in
+    a load-time constructor - a process-wide patch, so wiring it into the main executable is enough.
+    detect() keys on the Obj-C class marker being *imported by the game's own binaries* (not merely
+    defined in the SDK framework), so Unity titles fall to the C-ABI handlers (matched first)."""
+
+    shim_framework = "NetflixOffline.framework"
+    shim_binary = "NetflixOffline"
+    shim_load_path = "@rpath/NetflixOffline.framework/NetflixOffline"
+
+    def _sdk_present(self, app):
+        return (app / "Frameworks" / self.sdk_framework / self.sdk_binary).exists()
+
+    def _game_binaries(self, app):
+        """Main executable + engine framework binaries (not the SDK framework, which defines the marker)."""
+        skip = {self.sdk_framework, "NetflixGames-companion.framework", self.shim_framework}
+        out = [_bundle_binary(app)]
+        for d in sorted((app / "Frameworks").glob("*.framework")):
+            if d.name not in skip:
+                out.append(_bundle_binary(d))
+        return out
+
+    def _marker_importers(self, app):
+        out = []
+        for b in self._game_binaries(app):
+            try:
+                data = b.read_bytes() if b.exists() else b""
+            except Exception:
+                data = b""
+            if any(m in data for m in self.objc_markers):
+                out.append(b)
+        return out
+
+    def detect(self, app):
+        return self._sdk_present(app) and bool(self._marker_importers(app))
+
+    def apply(self, app):
+        main_bin = _bundle_binary(app)
+        targets = [main_bin] + [b for b in self._marker_importers(app) if b != main_bin]
+        _install_shim(app, self.shim_name, self.shim_framework, self.shim_binary,
+                      self.shim_load_path, targets)
+
+
+class Gen0ObjcHandler(ObjcSwizzleHandler):
+    """gen-0 NGP SDK via its Obj-C facade `NetflixSDK` (Unreal Engine titles). Swizzles
+    registerEventReceiver:/checkUserAuth to deliver a synthetic signed-in state, plus a local slot
+    store."""
+    key = "gen0-objc"
+    summary = "gen-0 NGP SDK, Obj-C NetflixSDK facade (Unreal Engine binding)"
+    sdk_framework = "NGP.framework"
+    sdk_binary = "NGP"
+    objc_markers = (b"_OBJC_CLASS_$_NetflixSDK",)
+    shim_name = "gen0_objc"
+
+
+class Gen2ObjcHandler(ObjcSwizzleHandler):
+    """gen-2 com.netflix.games SDK via its Swift @objc API (GameMaker titles). Swizzles
+    AccessProvider.requestPlayerAccess... to grant offline access and CloudSavesProvider read/write
+    to a local blob store (read-miss -> blobNameNotFound)."""
+    key = "gen2-objc"
+    summary = "gen-2 com.netflix.games SDK, Swift @objc API (GameMaker binding)"
+    sdk_framework = "NetflixGames.framework"
+    sdk_binary = "NetflixGames"
+    objc_markers = (b"_OBJC_CLASS_$_NetflixBlobContainer", b"NetflixGames15NetflixGamesSDK")
+    shim_name = "gen2_objc"
+
+
+# C-ABI (Unity) handlers first - they are the proven, most specific match; the Obj-C handlers
+# pick up the engines that drive the SDK through Obj-C/Swift instead (UE4, GameMaker).
+HANDLERS = [Gen2UnityHandler(), Gen0UnityHandler(), Gen2ObjcHandler(), Gen0ObjcHandler()]
