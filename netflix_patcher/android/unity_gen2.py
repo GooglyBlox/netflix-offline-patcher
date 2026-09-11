@@ -1,8 +1,8 @@
 """Newer (2025) com.netflix.games SDK reached through the Unity bridge
 (com.netflix.unity.impl.NfUnitySdkInternal): request-and-grant player access, plus
 cloud-save read/list/write offline stubs."""
-from .smali import (_PAI, _RES, _ERR, _RES_CTOR, _ONRESULT, _decl_file, patch_method,
-                    emit_offline_profile, offline_profile_body)
+from .smali import (_RES, _ERR, _RES_CTOR, _ONRESULT, _decl_file, patch_method,
+                    emit_offline_profile, offline_profile_body, emit_player_access_info)
 
 
 _PROFILES_API = "com/netflix/games/player/profiles/ProfilesApi"
@@ -23,17 +23,34 @@ def patch_current_profile(dec, report):
     report[st].append("grant-offline-profile")
 
 
+def build_patches(dec):
+    """Gen-2 patches. Per-APK: the PlayerAccessInfo ctor varies."""
+    grant = ["# pretend the player is a signed-in member"]
+    grant += emit_player_access_info(dec, "v0", "v1", "v2")
+    grant += [
+        f"new-instance v1, {_RES}",
+        "const/4 v2, 0x0",
+        f"invoke-direct {{v1, v0, v2}}, {_RES_CTOR}",
+        f"invoke-interface {{p1, v1}}, {_ONRESULT}",
+        "return-void",
+    ]
+    out = []
+    for p in PATCHES:
+        p = dict(p)
+        if p["name"] == "grant-player-access":
+            p["body"] = grant
+        out.append(p)
+    return out
+
+
 PATCHES = [
     {   # the login wall. hand back a granted result and skip the dead handshake.
+        # body set by build_patches()
         "name": "grant-player-access",
         "class": "com/netflix/unity/impl/NfUnitySdkInternal",
         "sig": "doRequestPlayerAccess(Lcom/netflix/games/Callback;)V",
         "critical": True, "locals": 3,
         "body": [
-            "# pretend the player is a signed-in member",
-            f"new-instance v0, {_PAI}",
-            'const-string v1, "offline-player"',
-            f"invoke-direct {{v0, v1}}, {_PAI}-><init>(Ljava/lang/String;)V",
             f"new-instance v1, {_RES}",
             "const/4 v2, 0x0",
             f"invoke-direct {{v1, v0, v2}}, {_RES_CTOR}",

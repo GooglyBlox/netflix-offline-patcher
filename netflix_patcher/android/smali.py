@@ -16,6 +16,28 @@ _RES_CTOR = f"{_RES}-><init>(Ljava/lang/Object;{_ERR})V"
 
 _ONRESULT = f"{_CB}->onResult({_RES})V"
 
+_MEMBERSHIP = "Lcom/netflix/games/player/access/MembershipStatus;"
+
+def pai_ctor(dec):
+    """PlayerAccessInfo ctor sig. SDK 1.9.x adds a MembershipStatus arg."""
+    f = find_smali_file(dec, "com/netflix/games/player/access/PlayerAccessInfo")
+    two = f"<init>(Ljava/lang/String;{_MEMBERSHIP})V"
+    if f is not None and two in f.read_text(encoding="utf-8", errors="ignore"):
+        return f"(Ljava/lang/String;{_MEMBERSHIP})V"
+    return "(Ljava/lang/String;)V"
+
+def emit_player_access_info(dec, dst, r_id, r_extra, player_id=None):
+    """Build a PlayerAccessInfo in dst. r_extra only used by the 2-arg ctor (MEMBER)."""
+    sig = pai_ctor(dec)
+    out = [f"new-instance {dst}, {_PAI}",
+           f'const-string {r_id}, "{player_id or OFFLINE_PLAYER_ID}"']
+    if _MEMBERSHIP in sig:
+        out.append(f"sget-object {r_extra}, {_MEMBERSHIP}->MEMBER:{_MEMBERSHIP}")
+        out.append(f"invoke-direct {{{dst}, {r_id}, {r_extra}}}, {_PAI}-><init>{sig}")
+    else:
+        out.append(f"invoke-direct {{{dst}, {r_id}}}, {_PAI}-><init>{sig}")
+    return out
+
 _ACCESS_API = "com/netflix/games/player/access/AccessApi"
 
 _BLOB_API = "com/netflix/games/storage/blobs/BlobStoreApi"

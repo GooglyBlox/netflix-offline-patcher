@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .tools import resolve_tools, run
 from .smali import find_smali_file, patch_method, SDK_MARKER_CLASS, strip_non_arm_libs
-from .unity_gen2 import PATCHES, patch_current_profile
+from .unity_gen2 import build_patches, patch_current_profile
 from .access_ui import is_legacy_sdk, patch_legacy
 from .gen0 import is_gen0_sdk, patch_gen0
 from .gamemaker import (is_gamemaker_sdk, patch_gamemaker, is_gamemaker_gen0_wrapper,
@@ -105,7 +105,7 @@ def run_android(in_path, out_path, args):
             patch_legacy(dec, report)
         else:
           patch_current_profile(dec, report)
-          for p in PATCHES:
+          for p in build_patches(dec):
             if p.get("cloud_save") and args.keep_cloud_save:
                 report["skipped"].append(p["name"]); continue
             f = find_smali_file(dec, p["class"])

@@ -4,6 +4,7 @@ access-granted / UI-hidden events so the boot handshake completes."""
 import sys
 from .. import MARKER
 from .smali import (find_smali_file, patch_method, _decl_file, _class_of,
+                    emit_player_access_info,
                     SDK_MARKER_CLASS, _PAI, _RES)
 
 
@@ -123,9 +124,7 @@ def patch_legacy(dec, report):
         f"invoke-direct {{p0}}, {NF}->getSdkContext()L{SCTX[1:]}",
         "move-result-object v1",
         f"invoke-direct {{v0, v1}}, {EVS}-><init>({SCTX})V",
-        f"new-instance v1, {_PAI}",
-        'const-string v2, "offline-player"',
-        f"invoke-direct {{v1, v2}}, {_PAI}-><init>(Ljava/lang/String;)V",
+    ] + emit_player_access_info(dec, "v1", "v2", "v3") + [
         "new-instance v2, Lcom/netflix/games/player/access/PlayerAccessEvent;",
         "const/4 v3, 0x0",
         f"invoke-direct {{v2, v1, v3}}, Lcom/netflix/games/player/access/PlayerAccessEvent;-><init>({_PAI}{_PAI})V",

@@ -2,7 +2,8 @@
 and BlobStoreApi implementations directly (grant player access, offline blob store)."""
 import sys
 from .smali import (find_smali_file, _decl_file, _decl_files_all, patch_method,
-                    _PAI, _RES, _ERR, _CB, _RES_CTOR, _RESCOMP, _ACCESS_API, _BLOB_API)
+                    _PAI, _RES, _ERR, _CB, _RES_CTOR, _RESCOMP, _ACCESS_API, _BLOB_API,
+                    emit_player_access_info)
 from .gen0 import _g0_slot_store_smali
 from .gamemaker import _GM2_READRES, _GM2_WRITERES, _GM2_BLOBC, _GM2_CONF, _GM2_DELRES
 
@@ -28,9 +29,7 @@ def patch_gen2_nobridge(dec, report):
         note(st, "suppress-error-screen")
 
     # 2. grant player access on every AccessApi impl
-    grant = [
-        f"new-instance v0, {_PAI}", 'const-string v1, "offline-player"',
-        f"invoke-direct {{v0, v1}}, {_PAI}-><init>(Ljava/lang/String;)V",
+    grant = emit_player_access_info(dec, "v0", "v1", "v2") + [
         f"new-instance v1, {_RES}", "const/4 v2, 0x0",
         f"invoke-direct {{v1, v0, v2}}, {_RES_CTOR}",
         f"invoke-interface {{p1, v1}}, {_CB}->onResult({_RES})V", "return-void"]

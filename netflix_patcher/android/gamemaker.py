@@ -3,7 +3,8 @@ class is the glue. Handles all three shapes seen: the oldest-SDK Nfxa* glue, the
 oldest-SDK NetflixWrapper glue, and the gen-2 com.netflix.games glue."""
 import re
 import sys
-from .smali import patch_method, find_smali_file, _PAI, _RES, _ERR
+from .smali import (patch_method, find_smali_file, _PAI, _RES, _ERR,
+                    emit_player_access_info)
 from .gen0 import _g0_slot_store_smali, _g0_authed_state
 from .. import MARKER
 from .gen0 import _G0_STATE, _G0_CSS, _G0_CONF
@@ -365,9 +366,7 @@ def patch_gamemaker_gen2(dec, report):
 
     # access grant: NfxaShowUI -> synthesize a granted result, call the requestPlayerAccess callback
     cb2, _ = _gm_callback(orig("NfxaShowUI()"))
-    show = [
-        f"new-instance v0, {_PAI}", 'const-string v1, "offline-player"',
-        f"invoke-direct {{v0, v1}}, {_PAI}-><init>(Ljava/lang/String;)V",
+    show = emit_player_access_info(dec, "v0", "v1", "v2") + [
         f"new-instance v1, {_RES}", "const/4 v2, 0x0",
         f"invoke-direct {{v1, v0, v2}}, {_RES}-><init>(Ljava/lang/Object;{_ERR})V",
         f"new-instance v0, {cb2}", f"invoke-direct {{v0, p0}}, {cb2}-><init>({glue})V",
