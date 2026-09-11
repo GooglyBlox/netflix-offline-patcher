@@ -12,6 +12,8 @@
  *   auth code    : {"tracker":<n>,"errorCode":0,"errorMessage":"","playerAuthorizationCode":"offline"}
  *   cloud list   : {"result":{"slotIds":[]},"error":null}
  *   cloud error  : {"result":null,"error":{"code":404,"message":"offline"}}
+ *   profile      : {"profileId":"<id>","handle":"Offline","preferredLanguage":"en","errorMessage":"","errorCode":0}
+ *   legacy value : {"errorCode":0,"errorMessage":"","value":"<v>"}
  */
 
 typedef void (*disp1_t)(const char *);
@@ -67,6 +69,41 @@ static void nfoff_get_player_authorization_code(int tracker, disp1_t disp)
 /* Obsolete access-UI entry (older SDK path). Never present the Netflix login UI. */
 static void nfoff_show_access_ui(void) { /* no-op */ }
 
+/* Profiles API. Must answer synchronously: the caller reads a static on return. */
+static void nfoff_profiles_get_current_profile(disp1_t disp)
+{
+    char buf[224], *p = buf;
+    if (!disp) return;
+    p = j_cpy(p, "{\"profileId\":\"");
+    p = j_cpy(p, PLAYER_ID);
+    p = j_cpy(p, "\",\"handle\":\"Offline\",\"preferredLanguage\":\"en\","
+                 "\"errorMessage\":\"\",\"errorCode\":0}");
+    *p = 0;
+    disp(buf);
+}
+
+/* Legacy token/id share one result shape. The id must match the profile's. */
+static void nfoff_legacy_value(disp1_t disp, const char *value)
+{
+    char buf[192], *p = buf;
+    if (!disp) return;
+    p = j_cpy(p, "{\"errorCode\":0,\"errorMessage\":\"\",\"value\":\"");
+    p = j_cpy(p, value);
+    p = j_cpy(p, "\"}");
+    *p = 0;
+    disp(buf);
+}
+
+static void nfoff_profiles_get_legacy_gamer_access_token(disp1_t disp)
+{
+    nfoff_legacy_value(disp, "offline");
+}
+
+static void nfoff_profiles_get_legacy_id(disp1_t disp)
+{
+    nfoff_legacy_value(disp, PLAYER_ID);
+}
+
 /* Cloud-save list: no saved blobs, so the game starts from its local save. */
 static void nfoff_blob_get_blobs(int cid, disp2_t cb)
 {
@@ -107,6 +144,9 @@ extern NGP_IMPORT void ngp_blob_store_read(int, const char *, disp2_t);
 extern NGP_IMPORT void ngp_blob_store_write(int, const char *, const void *, int, disp2_t);
 extern NGP_IMPORT void ngp_blob_store_delete(int, const char *, disp2_t);
 extern NGP_IMPORT void ngp_blob_store_resolve_conflict(int, const char *, int, disp2_t);
+extern NGP_IMPORT void ngp_profiles_get_current_profile(disp1_t);
+extern NGP_IMPORT void ngp_profiles_get_legacy_gamer_access_token(disp1_t);
+extern NGP_IMPORT void ngp_profiles_get_legacy_id(disp1_t);
 
 #define INTERPOSE(newf, oldf)                                                  \
     __attribute__((used)) static struct { const void *r; const void *o; }      \
@@ -121,3 +161,7 @@ INTERPOSE(nfoff_blob_read,                    ngp_blob_store_read);
 INTERPOSE(nfoff_blob_write,                   ngp_blob_store_write);
 INTERPOSE(nfoff_blob_delete,                  ngp_blob_store_delete);
 INTERPOSE(nfoff_blob_resolve_conflict,        ngp_blob_store_resolve_conflict);
+INTERPOSE(nfoff_profiles_get_current_profile, ngp_profiles_get_current_profile);
+INTERPOSE(nfoff_profiles_get_legacy_gamer_access_token,
+                                              ngp_profiles_get_legacy_gamer_access_token);
+INTERPOSE(nfoff_profiles_get_legacy_id,       ngp_profiles_get_legacy_id);

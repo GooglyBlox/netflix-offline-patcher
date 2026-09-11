@@ -48,3 +48,8 @@ NULL and its interpose becomes a no-op).
 
 `NetflixOffline.framework/Info.plist` is a minimal framework plist. It only needs
 `CFBundleExecutable = NetflixOffline` and an identifier; the sideloader re-signs it.
+
+## Relinking drops libSystem
+
+`ld64.lld` does not add `LC_LOAD_DYLIB /usr/lib/libSystem.B.dylib`, and dyld will not load an
+image without it. Re-add it after every rebuild (LIEF snippet above).

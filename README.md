@@ -103,7 +103,8 @@ symbols are `weak_import`, so one prebuilt binary fits every title of that gener
 
 - **gen-2 `com.netflix.games`** (`NetflixGames.framework`): `ngp_request_player_access` hands
   back a granted `PlayerAccessInfo`; the access-UI call is a no-op; `ngp_blob_store_*` return an
-  offline "no cloud save" result. (shim `gen2_unity`)
+  offline "no cloud save" result; `ngp_profiles_*` return a synthetic offline profile (the
+  iOS twin of Android's `grant-offline-profile`). (shim `gen2_unity`)
 - **gen-0 NGP** (`NGP.framework`): auth is event-driven, so the shim captures the event
   dispatcher and, on `ngp_check_user_authentication`, fires a synthetic `onUserStateChange`
   signed-in event, plus a local slot store (read-miss = `ErrorUnknownSlotId`). (shim `gen0_unity`)
