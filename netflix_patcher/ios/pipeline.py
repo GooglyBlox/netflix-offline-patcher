@@ -50,6 +50,18 @@ def _relax_install_restrictions(app):
         print(f"      relaxed install restrictions: file sharing on{note}")
 
 
+_MACHO_MAGICS = (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca")
+
+
+def _unix_mode(src_info, path):
+    """Input's Unix mode, else 0755 for Mach-O, 0644 otherwise."""
+    if src_info is not None and src_info.create_system == 3 and (src_info.external_attr >> 16):
+        return src_info.external_attr >> 16
+    with open(path, "rb") as fh:
+        is_macho = fh.read(4) in _MACHO_MAGICS
+    return 0o100755 if is_macho else 0o100644
+
+
 def run_ios(in_path, out_path, args):
     work = Path(tempfile.mkdtemp(prefix="nfxpatch_ios_"))
     print(f"[*] work dir: {work}")
@@ -82,10 +94,19 @@ def run_ios(in_path, out_path, args):
         print("[3/3] repackaging IPA")
         if out_path.exists():
             out_path.unlink()
+        # NTFS drops exec bits: restore Unix modes from the input IPA
+        with zipfile.ZipFile(in_path) as zin:
+            orig = {i.filename: i for i in zin.infolist()}
         with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as z:
             for f in sorted(payload.rglob("*")):
                 if f.is_file() or f.is_symlink():
-                    z.write(f, arcname=str(f.relative_to(work).as_posix()))
+                    arc = str(f.relative_to(work).as_posix())
+                    zi = zipfile.ZipInfo.from_file(f, arcname=arc)
+                    zi.compress_type = zipfile.ZIP_DEFLATED
+                    zi.external_attr = _unix_mode(orig.get(arc), f) << 16
+                    zi.create_system = 3
+                    with open(f, "rb") as src, z.open(zi, "w") as dst:
+                        shutil.copyfileobj(src, dst, 1 << 20)
         print(f"\n[done] offline IPA (unsigned): {out_path}")
         print("       Netflix gate removed. Sideload it (AltStore / Sideloadly) to re-sign and install.")
         print("       heads-up: a game with its own dead backend may still stall after the Netflix screen.")
