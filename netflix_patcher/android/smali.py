@@ -1,6 +1,7 @@
 """Shared smali primitives: method-body rewriting, class lookup, and the SDK type
 names the patched bodies reference across every generation."""
 import shutil
+import re
 from .. import MARKER
 
 
@@ -139,7 +140,14 @@ def emit_offline_profile(dec):
     if cp is None:
         return None
     ctor = "<init>(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"
-    if f".method public constructor {ctor}" not in cp.read_text(encoding="utf-8"):
+    text = cp.read_text(encoding="utf-8")
+    abstract = set(re.findall(r"^\.method[^\n]*\babstract\s+(\S+)", text, re.M))
+    supported = {"getLegacyGamerAccessToken()" + _RES, "getLegacyGamerProfileId()" + _RES}
+    # Refuse unknown abstract contracts: assembling dex alone would not catch
+    # an AbstractMethodError when the game first uses the profile.
+    if (f".method public constructor {ctor}" not in text
+            or re.search(r"^\.class[^\n]*\bfinal\b", text, re.M)
+            or not abstract.issubset(supported)):
         return None
 
     def _with_data(value):
@@ -168,7 +176,10 @@ def emit_offline_profile(dec):
 
 def offline_profile_body(cls):
     """Method body handing back NetflixResult.withData(<the offline profile>)."""
-    return [f"new-instance v0, {cls}",
+    return ['const-string v0, "NfxOffline"',
+            'const-string v1, "getCurrentProfile: local profile; platform readiness unchanged"',
+            "invoke-static {v0, v1}, Landroid/util/Log;->d(Ljava/lang/String;Ljava/lang/String;)I",
+            f"new-instance v0, {cls}",
             f"invoke-direct {{v0}}, {cls}-><init>()V",
             f"sget-object v1, {_RES}->Companion:{_RESCOMP}",
             f"invoke-virtual {{v1, v0}}, {_RESCOMP}->withData(Ljava/lang/Object;){_RES}",

@@ -1,10 +1,11 @@
-"""Gen-2 com.netflix.games SDK with no engine glue at all: patch the SDK's own AccessApi
-and BlobStoreApi implementations directly (grant player access, offline blob store)."""
+"""Gen-2 direct SDK calls: local access/profile results and an offline blob store."""
 import sys
 from .smali import (find_smali_file, _decl_file, _decl_files_all, patch_method,
-                    _PAI, _RES, _ERR, _CB, _RES_CTOR, _RESCOMP, _ACCESS_API, _BLOB_API,
+                    _RES, _ERR, _RES_CTOR, _RESCOMP, _ACCESS_API, _BLOB_API,
                     emit_player_access_info)
 from .gen0 import _g0_slot_store_smali
+from .gen2_profiles import patch_current_profile
+from .gen2_callbacks import emit_result_delivery, deliver
 from .gamemaker import _GM2_READRES, _GM2_WRITERES, _GM2_BLOBC, _GM2_CONF, _GM2_DELRES
 
 
@@ -20,19 +21,32 @@ def patch_gen2_nobridge(dec, report):
     def note(status, name):
         report[status].append(name)
 
+    # Access and profiles are independent SDK surfaces. Do this before granting
+    # access, whose callback may immediately re-enter getCurrentProfile().
+    patch_current_profile(dec, report)
+    emit_result_delivery(dec)
+
     # 1. suppress the SDK error dialog (3-arg gen-2 variant)
     ef = find_smali_file(dec, "com/netflix/mediaclient/ui/errors/SdkErrorActivity$Companion")
     if ef is not None:
-        new, st = patch_method(ef.read_text(encoding="utf-8"), "startSdkErrorActivity(", 0, ["return-void"])
+        new, st = patch_method(ef.read_text(encoding="utf-8"), "startSdkErrorActivity(", 2, [
+            'const-string v0, "NfxOffline"',
+            'const-string v1, "SDK error UI suppressed; inspect NetflixPlatform startup logs"',
+            "invoke-static {v0, v1}, Landroid/util/Log;->w(Ljava/lang/String;Ljava/lang/String;)I",
+            "return-void"])
         if st == "patched":
             ef.write_text(new, encoding="utf-8")
         note(st, "suppress-error-screen")
 
     # 2. grant player access on every AccessApi impl
-    grant = emit_player_access_info(dec, "v0", "v1", "v2") + [
+    grant = [
+        'const-string v0, "NfxOffline"',
+        'const-string v1, "requestPlayerAccess: offline grant; platform readiness unchanged"',
+        "invoke-static {v0, v1}, Landroid/util/Log;->d(Ljava/lang/String;Ljava/lang/String;)I",
+    ] + emit_player_access_info(dec, "v0", "v1", "v2") + [
         f"new-instance v1, {_RES}", "const/4 v2, 0x0",
         f"invoke-direct {{v1, v0, v2}}, {_RES_CTOR}",
-        f"invoke-interface {{p1, v1}}, {_CB}->onResult({_RES})V", "return-void"]
+        deliver("p1", "v1"), "return-void"]
     hit = False
     for f in _decl_files_all(dec, _ACCESS_API):
         new, st = patch_method(f.read_text(encoding="utf-8"),
@@ -60,7 +74,7 @@ def patch_gen2_nobridge(dec, report):
             f"new-instance v1, {_ERR}", "const/16 v2, -0x3e9", 'const-string v3, "not found"',
             f"invoke-direct {{v1, v2, v3}}, {_ERR}-><init>(ILjava/lang/String;)V",
             "const/4 v2, 0x0", f"new-instance v0, {_RES}", f"invoke-direct {{v0, v2, v1}}, {_RES_CTOR}",
-            ":nfx_deliver", f"invoke-interface {{p2, v0}}, {_CB}->onResult({_RES})V", "return-void"]
+            ":nfx_deliver", deliver("p2", "v0"), "return-void"]
         write = [
             f"invoke-virtual {{p2}}, {_GM2_BLOBC}->getBlob()[B", "move-result-object v0",
             "const/4 v1, 0x2",  # Base64.NO_WRAP
@@ -69,18 +83,18 @@ def patch_gen2_nobridge(dec, report):
             f"new-instance v0, {_GM2_WRITERES}", "const/4 v1, 0x0",
             f"invoke-direct {{v0, v1}}, {_GM2_WRITERES}-><init>({_GM2_CONF})V",
             f"new-instance v2, {_RES}", f"invoke-direct {{v2, v0, v1}}, {_RES_CTOR}",
-            f"invoke-interface {{p3, v2}}, {_CB}->onResult({_RES})V", "return-void"]
+            deliver("p3", "v2"), "return-void"]
         getids = [
             f"invoke-static {{}}, {store}->list()Ljava/util/ArrayList;", "move-result-object v0",
             f"sget-object v1, {_RES}->Companion:{_RESCOMP}",
             f"invoke-virtual {{v1, v0}}, {_RESCOMP}->withData(Ljava/lang/Object;){_RES}", "move-result-object v0",
-            f"invoke-interface {{p1, v0}}, {_CB}->onResult({_RES})V", "return-void"]
+            deliver("p1", "v0"), "return-void"]
         delete = [
             f"invoke-static {{p1}}, {store}->delete(Ljava/lang/String;)V",
             f"new-instance v0, {_GM2_DELRES}", "const/4 v1, 0x0",
             f"invoke-direct {{v0, v1}}, {_GM2_DELRES}-><init>({_GM2_CONF})V",
             f"new-instance v2, {_RES}", f"invoke-direct {{v2, v0, v1}}, {_RES_CTOR}",
-            f"invoke-interface {{p2, v2}}, {_CB}->onResult({_RES})V", "return-void"]
+            deliver("p2", "v2"), "return-void"]
         return read, write, getids, delete
 
     for f in _decl_files_all(dec, _BLOB_API):
