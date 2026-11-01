@@ -7,7 +7,8 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from .tools import resolve_tools, run
+from .tools import resolve_tools, run, apktool_build_flags
+from .apk_validation import validate_merged_payload
 from .smali import find_smali_file, patch_method, SDK_MARKER_CLASS, strip_non_arm_libs
 from .unity_gen2 import build_patches, patch_current_profile
 from .access_ui import is_legacy_sdk, patch_legacy
@@ -46,7 +47,7 @@ def unpack_input(path, workdir):
 
 def run_android(in_path, out_path, args):
     T = resolve_tools(args)
-    need = ["java", "apktool"] + ([] if args.no_sign else ["apkeditor", "zipalign", "apksigner", "keystore"])
+    need = ["java", "apktool"] + ([] if args.no_sign else ["zipalign", "apksigner", "keystore"])
     missing = [k for k in need if not T[k]]
     if missing:
         sys.exit("! missing tool paths: " + ", ".join(missing) +
@@ -61,6 +62,8 @@ def run_android(in_path, out_path, args):
         print("[1/5] unpacking input")
         base_apk, splits = unpack_input(in_path, work)
         print(f"      base: {base_apk.name}  splits: {len(splits)}")
+        if splits and not T["apkeditor"]:
+            sys.exit("! APKEditor is required to merge split inputs, including with --no-sign")
 
         print("[2/5] decoding base (apktool, resources kept raw)")
         dec = work / "apktool_base"
@@ -128,20 +131,24 @@ def run_android(in_path, out_path, args):
 
         print("[4/5] rebuilding base")
         base_out = work / "base_patched.apk"
-        run([T["java"], "-jar", T["apktool"], "b", "--use-aapt2", "-o", str(base_out), str(dec)], env=env)
+        flags = apktool_build_flags(T["java"], T["apktool"], env)
+        run([T["java"], "-jar", T["apktool"], "b", *flags, "-o", str(base_out), str(dec)], env=env)
 
         if splits:
             print(f"[5/5] merging base + {len(splits)} split(s), then signing")
             merge_in = work / "merge_in"; merge_in.mkdir()
             shutil.copy(base_out, merge_in / "base.apk")
+            merge_inputs = [base_out]
             for s in splits:
                 # libyoyo is arm-only, so drop the engine-less x86 arch splits to run under ARM translation
                 if gamemaker and re.search(r"config\.x86(_64)?\.apk$", s.name):
                     print(f"      (skip {s.name}: arm-only engine)")
                     continue
                 shutil.copy(s, merge_in / s.name)
+                merge_inputs.append(s)
             to_sign = work / "merged.apk"
             run([T["java"], "-jar", T["apkeditor"], "m", "-i", str(merge_in), "-o", str(to_sign), "-f"], env=env)
+            validate_merged_payload(merge_inputs, to_sign)
         else:
             print("[5/5] signing (single APK, no splits)")
             to_sign = base_out

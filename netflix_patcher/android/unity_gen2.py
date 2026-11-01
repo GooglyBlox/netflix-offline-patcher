@@ -1,26 +1,8 @@
 """Newer (2025) com.netflix.games SDK reached through the Unity bridge
 (com.netflix.unity.impl.NfUnitySdkInternal): request-and-grant player access, plus
 cloud-save read/list/write offline stubs."""
-from .smali import (_RES, _ERR, _RES_CTOR, _ONRESULT, _decl_file, patch_method,
-                    emit_offline_profile, offline_profile_body, emit_player_access_info)
-
-
-_PROFILES_API = "com/netflix/games/player/profiles/ProfilesApi"
-
-
-def patch_current_profile(dec, report):
-    """Synthetic profile from getCurrentProfile(), patched in the ProfilesApi impl. A title can
-    gate boot on the profile rather than on access, and spin forever on the offline error."""
-    cls = emit_offline_profile(dec)
-    impl = _decl_file(dec, _PROFILES_API, "implements")
-    if cls is None or impl is None:
-        report["not_found"].append("grant-offline-profile")
-        return
-    new, st = patch_method(impl.read_text(encoding="utf-8"), "getCurrentProfile()", 3,
-                           offline_profile_body(cls))
-    if st == "patched":
-        impl.write_text(new, encoding="utf-8")
-    report[st].append("grant-offline-profile")
+from .smali import _RES, _ERR, _RES_CTOR, _ONRESULT, emit_player_access_info
+from .gen2_profiles import patch_current_profile
 
 
 def build_patches(dec):

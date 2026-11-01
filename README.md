@@ -48,7 +48,10 @@ The login check lives in the Netflix Games SDK, not the game. Every title bundle
 SDK in `classes.dex` and calls into it over JNI, so one set of smali patches works whatever
 the engine is. The tool decodes the base APK with apktool, detects which SDK generation and
 engine it is facing, patches, then rebuilds, merges any splits with APKEditor, zipaligns,
-and signs. It aborts if a critical method has drifted out of reach.
+and signs. It aborts if a critical method has drifted out of reach. Split merging checks
+that assets and native libraries retain their paths, sizes and CRCs, and that originally
+uncompressed entries remain uncompressed (required by file-descriptor/mmap consumers).
+A resource table must survive when present; its internal references are not fully validated.
 
 Netflix shipped three SDK generations. Through the Unity bridge
 (`com.netflix.unity.impl.NfUnitySdkInternal`):
@@ -77,7 +80,14 @@ bridge; the tool finds it by parsing:
 - **Unreal** (`libUE4.so`): an Unreal JNI glue (`Thunk_*` in, `native nativeOn*` out) on the
   oldest SDK. The tool rewrites the glue to deliver a synthetic signed-in profile straight to
   the native callback. Auth only; progress lives in the engine's own save.
-- **No engine glue:** patch the SDK's own AccessApi and BlobStoreApi implementations directly.
+- **Direct SDK calls (no recognized engine bridge):** patch AccessApi, ProfilesApi and
+  BlobStoreApi implementations, including implementations in multiple dex files. Access
+  success and current-profile retrieval are independent: both return a local result.
+  Direct SDK access/blob callbacks are queued once on Android's main looper, so games
+  can finish registering their pending request before the result arrives. SDK startup
+  and event registration remain intact; no internal platform-ready flag is forged.
+  The profile uses the same existing stable offline identity as PlayerAccessInfo.
+  Unknown profile contracts stop with a diagnostic instead of reporting success.
 
 > **Note (GameMaker and Unreal):** resources are kept raw, so the binary manifest is not
 > edited. If a game declares the `com.netflix.nfgsdk.permission.ngpstore` permission,
@@ -137,6 +147,9 @@ netflix_patcher/
   android/
     smali.py                   shared smali primitives and SDK type names
     unity_gen2.py              gen-2 SDK, Unity bridge
+    gen2_profiles.py           shared gen-2 current-profile patch
+    gen2_callbacks.py          direct SDK main-looper callback delivery
+    apk_validation.py          split asset/library preservation checks
     access_ui.py               older access-UI SDK
     gen0.py                    oldest com.netflix.android.api SDK
     gamemaker.py               GameMaker glue (all shapes)
@@ -164,8 +177,12 @@ The iOS path needs only Python 3. The Android path also needs:
 - **JDK 11+**, from [Adoptium](https://adoptium.net). Point `--java` at it, set `JAVA_HOME`,
   or leave it to `java` on `PATH`.
 - **apktool**, `apktool.jar` from [apktool.org](https://apktool.org/docs/install), via `--apktool`.
+  The builder requests `--use-aapt2` on 2.x releases before 2.9, uses the aapt2 default
+  on 2.9+, and omits the removed flag on 3.x. See the [2.x CLI reference](https://apktool.org/docs/2.x/cli-parameters/)
+  and [3.0 migration notes](https://apktool.org/blog/apktool-3.0.0/). This selects build
+  flags; it does not guarantee every APK can be decoded by every historical Apktool.
 - **APKEditor**, `APKEditor.jar` from its [releases](https://github.com/REAndroid/APKEditor/releases),
-  via `--apkeditor`. Used to merge split bundles.
+  via `--apkeditor`. Required for split bundles even with `--no-sign`; optional for a single APK.
 - **Android build-tools** (`zipalign`, `apksigner`), from Android Studio's SDK Manager or the
   [command-line tools](https://developer.android.com/tools/releases/cmdline-tools). Picked up
   automatically when `ANDROID_HOME` is set.
@@ -190,6 +207,39 @@ file sets them once:
   "ks_pass": "android", "ks_alias": "androiddebugkey", "key_pass": "android"
 }
 ```
+
+## Android validation and troubleshooting
+
+Run the dependency-free regression suite from the repository root:
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+Always patch the original APK/bundle when testing a newer patcher. Existing patch markers
+make repeated runs idempotent; older patched output is not a substitute for the original.
+For startup hangs, use `--keep-work` and capture `adb logcat -v threadtime` while launching.
+Filter `NfxOffline` to see local access/profile calls and suppressed SDK error screens,
+then inspect the surrounding SDK and game logs. A granted access callback does not mean
+NetflixPlatform initialization succeeded. A missing profile patch or unsupported signature
+is a patch-time error when ProfilesApi is present.
+
+Check `merge verified` in the patcher output, then verify the signed artifact:
+
+```sh
+apksigner verify --verbose game-offline.apk
+zipalign -c -p 4 game-offline.apk
+```
+
+Keep every required split, including asset packs such as `split_resourcespack.apk`.
+Install-time assets normally use AssetManager; fast-follow/on-demand packs can require
+Play delivery state or network services even when some files are present. See
+[Android's asset delivery guide](https://developer.android.com/guide/playcore/asset-delivery/integrate-java).
+The merge check detects payload loss/compression changes, not every resource-table or
+runtime asset-delivery issue. Do not assume a remaining black screen is authentication.
+
+See [the Into the Breach investigation](docs/android-gen2-startup.md) for the traced
+failure, validation evidence, remaining device checks and Docker instructions.
 
 ## Limitations
 

@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import subprocess
+import re
 from pathlib import Path
 from .. import REPO_ROOT
 
@@ -47,3 +48,20 @@ def resolve_tools(args):
 def run(cmd, **kw):
     print("  $ " + " ".join(str(c) for c in cmd))
     return subprocess.run(cmd, check=True, **kw)
+
+
+def apktool_build_flags(java, apktool, env):
+    """Explicit aapt2 for pre-2.9; default aapt2 for 2.9+ and 3.x.
+
+    Apktool 3 removed --use-aapt2. Do not retry arbitrary build failures with
+    different resource compilers: that can hide the actual rebuild error.
+    """
+    result = run([java, "-jar", apktool, "--version"], env=env,
+                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    version = result.stdout.strip()
+    match = re.search(r"(?<![\d.])(\d+)\.(\d+)(?:\.\d+)?", version)
+    if match is None or int(match[1]) < 2:
+        raise RuntimeError(f"Unsupported/unrecognized Apktool version: {version!r}")
+    flags = ["--use-aapt2"] if (int(match[1]), int(match[2])) < (2, 9) else []
+    print(f"      Apktool {version}; aapt2 {'explicit' if flags else 'default'}")
+    return flags
